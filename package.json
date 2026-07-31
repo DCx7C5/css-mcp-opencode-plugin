@@ -1,0 +1,23 @@
+{
+  "name": "css-mcp-opencode-plugin",
+  "version": "0.1.0",
+  "description": "OpenCode ↔ Python bridge plugin: Python brain, JS blocking gate over a Unix socket",
+  "type": "module",
+  "main": "socket-bridge.js",
+  "files": [
+    "socket-bridge.js"
+  ],
+  "scripts": {
+    "check": "node --check socket-bridge.js"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "^1.18.10"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "mcp",
+    "bridge"
+  ],
+  "license": "MIT"
+}
