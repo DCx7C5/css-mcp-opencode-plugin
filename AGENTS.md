@@ -17,11 +17,11 @@ OpenCode ↔ Python bridge. The JS plugin (`socket-bridge.js`) is a thin transpo
 ## Architecture
 
 - `socket-bridge.js` (repo root, ESM): OpenCode plugin, V1 named export `PythonBridge = async ({client, directory, worktree, project}) => hooks`. SocketPool = one shared Unix socket, UUID-multiplexed RPC, reconnect with backoff, event debouncing, push handling.
-- Python brain (Phase 4, `mcps/css-mcp`): runs **both** a Unix-socket NDJSON server **and** a stdio MCP server, sharing in-process PermissionStore + TaskManager + A2A ingestion.
+- Python brain: **not part of this repo** (the `mcps/css-mcp` package was removed). The socket transport still expects an external server at `/var/run/css-mcp/hooks.sock`; without one, blocking ops fail closed. Test the transport with `scripts/client.py`.
 - Socket: `/var/run/css-mcp/hooks.sock` (`OPENCODE_PYTHON_SOCK` override), NDJSON `\n`-delimited, UTF-8.
 - Two channels: **socket** (JS↔Py) and **MCP stdio** (OpenCode↔Py).
 
-## Protocol (v0.4 draft — gated by rubber-duck review, do not implement against until gate passes)
+## Protocol (v0.4 draft — reference implementation: `scripts/client.py`)
 
 Message classes:
 - Request JS→Py: `{id, op, body}` (id = UUID v4)
@@ -70,20 +70,19 @@ Key semantics (do not regress):
 ## Current status / TODOs
 
 - [running] SPIKE — event-hook await semantics (bgagent `045ec89b`; gates event.pipeline branch)
-- [running] SCAFFOLD — uv workspace + `mcps/css-mcp` (bgagent `045ec5ce`)
 - [running] JS TRANSPORT HARDENING v2 — C1 ok:false validation, C2a fail-closed default, H1 timer leak, M1 idempotent #onDisconnect, #7 isFinite parse+pre 5s, #8 SHORT_TIMEOUT_MS, #9 end/destroyed guard, #10 dead branch removal, #11 short-id counter, #buf cap (bgagent `045ec0f1`)
 - [running] PUBLISHABILITY — package.json, LICENSE, README, git init (bgagent `045e51bf`)
 - [pending] Spec v0.4 finalization (spike verdict picks the H2/H3 branch) + rubber-duck re-gate
 - [pending] Phase 2 — JS FIX #1–#6 (reply-expectation, deadline retry, server dedupe, #onDisconnect batch semantics, push-before-orphan, maxPending)
 - [pending] Phase 3 — shim rewrite: bootstrap handshake + capabilities, permission.ask hook, task authority, config deltas, session.inject consumer (verify `client.session.prompt`/`paste` in installed `@opencode-ai/sdk`)
-- [pending] Phase 4 — Py socket server, permission module, TaskManager, MCP tools, A2A ingestion, register css-mcp in `.ai/mcp/mcp.json`
+- Note: the Python brain (socket server, permission module, TaskManager, MCP tools, A2A ingestion) is **out of repo scope** — implement it externally or as a separate project.
 
 ## Known decisions (do not reverse without discussion)
 
 - Option A: Python brain, JS blocking gate.
 - Blocking ops fail-closed by default; `OPENCODE_FAIL_OPEN` explicit opt-in.
 - `permission.ask` hook is the permission authority (`client.permission.update()` does not exist).
-- No plugin API launches subagents → pre-hook authority over `tool==="task"` + Python TaskManager via MCP tools.
+- No plugin API launches subagents → pre-hook authority over `tool==="task"` (Python-side TaskManager tools are out of repo scope).
 - `config` hook mutates only at load → Python supplies config deltas at bootstrap; runtime `config.update` push channel dropped.
 - `session.inject` push channel added for live content injection / A2A (new in v0.4).
 - GitHub URL plugin loading is an open feature request (opencode#8264/#12378) — npm publish is the supported path.
@@ -94,9 +93,9 @@ Key semantics (do not regress):
 - `package.json` — npm-publishable plugin metadata (`main: socket-bridge.js`)
 - `AGENTS.md` — this file
 - `README.md` — user-facing usage (npm / github URL / local symlink)
-- `pyproject.toml` — uv virtual workspace, members: `mcps/css-mcp`
-- `mcps/css-mcp/src/css_mcp/` — Python package (`config.py`, `logging.py`, `__main__.py`)
-- `.ai/mcp/mcp.json` — MCP registration (css-mcp server added in Phase 4)
+- `pyproject.toml` — plain Python project (no workspace): `msgspec` dep for `scripts/client.py` + `test` dependency group (pytest/ruff)
+- `scripts/client.py` — NDJSON socket-bridge test client (v0.4 protocol) with `--serve` mode as the minimal test brain
+- `.ai/mcp/mcp.json` — project-local MCP registration
 - `LICENSE` — MIT
 
 ## Environment variables
@@ -111,7 +110,22 @@ Key semantics (do not regress):
 | OPENCODE_FAIL_OPEN | unset → fail-closed; "1" → fail open |
 | OPENCODE_BRIDGE_DEBUG | unset / "1" |
 
-Python side uses `CSS_MCP_*` equivalents (CSS_MCP_SOCKET, CSS_MCP_PRE_TIMEOUT, CSS_MCP_FAIL_OPEN_BLOCKING, CSS_MCP_DEBUG, …).
+## Testing the plugin
+
+- The project opencode config lives in `.opencode/opencode.json` — not a root-level `opencode.json`.
+- The `plugin` entry for `socket-bridge.js` is **removed by default**: with no Python brain running, the fail-closed `tool.execute.before` pre-hook would block every tool call.
+- To test the plugin, add the entry to `.opencode/opencode.json` and **restart opencode** (config is load-only, not hot-reloaded):
+
+  ```json
+  {
+    "$schema": "https://opencode.ai/config.json",
+    "plugin": ["../socket-bridge.js"]
+  }
+  ```
+
+  `../socket-bridge.js` is relative to `.opencode/` and resolves to the repo-root `socket-bridge.js`.
+- While testing, keep `OPENCODE_FAIL_OPEN=1` exported — there is no Python brain in this repo, so without it every blocking op (`bootstrap`, `pre`, `permission`) times out and blocks the tool again.
+- `scripts/client.py --serve` is the minimal test brain: it listens on the socket (default `/var/run/css-mcp/hooks.sock`, or `--socket`), replies to every op (never to `event`), and never denies `pre`/`permission`. Use `--push-channel <ch>` to broadcast a test push every `--push-interval` seconds (default 5). Ctrl-C exits with code 130 and removes the socket.
 
 ## Tech stack / conventions
 
@@ -121,3 +135,8 @@ Python side uses `CSS_MCP_*` equivalents (CSS_MCP_SOCKET, CSS_MCP_PRE_TIMEOUT, C
 - Tests: `uv run --group test pytest`.
 - JS: ESM, `node --check` (or `bun build`) to verify.
 - Dispatched sub-agents: run `plan-dev_verify()` after changes (ruff + basedpyright); never call `plan-dev_get_work()`/`plan-dev_finished_work()` when dispatched by the planner.
+
+## CRITICAL RULES:
+
+> [!CAUTION]
+> heavily reduce chat output and thinking output to about < 1000 tokens 
