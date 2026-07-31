@@ -54,8 +54,8 @@ const log = {
  * Validate a server reply: only `{ok: true}` responses are usable.
  * An error reply `{ok:false, error:{code,message}}` is truthy but must behave
  * exactly like no reply (null) in every hook.
- * @param {object|null} msg
- * @returns {object|null}
+ * @param {Record<string, any>|null} msg
+ * @returns {Record<string, any>|null}
  */
 const okReply = (msg) => (msg && msg.ok === true ? msg : null)
 
@@ -138,9 +138,9 @@ class SocketPool {
     #connecting = false
     /** @type {string} */
     #buf = ""
-    /** @type {Map<string, { resolve: (v: object|null) => void, timer: ReturnType<typeof setTimeout> }>} */
+    /** @type {Map<string, { resolve: (v: Record<string, any> | null) => void, timer: number | ReturnType<typeof setTimeout> }>} */
     #pending = new Map()
-    /** @type {number | null} */
+    /** @type {number | ReturnType<typeof setTimeout> | null} */
     #reconnectTimer = null
     /** @type {number} */
     #reconnectDelay = RECONNECT_BASE_MS
@@ -148,16 +148,6 @@ class SocketPool {
     /** @param {string} path — UNIX socket path */
     constructor(path) {
         this.#path = path
-    }
-
-    /** Number of in-flight requests. */
-    get pendingCount() {
-        return this.#pending.size
-    }
-
-    /** Whether the socket is currently connected. */
-    get connected() {
-        return this.#socket !== null && !this.#socket.destroyed && this.#socket.writable
     }
 
     /** Ensure we have a live connection.  No-op if already connected or connecting. */
@@ -181,7 +171,8 @@ class SocketPool {
         })
 
         socket.on("data", (chunk) => {
-            this.#buf += chunk.toString("utf8")
+            // toString() defaults to utf8, the NDJSON protocol encoding.
+            this.#buf += chunk.toString()
             if (this.#buf.length > 1_000_000) {
                 log.error("pool: buffer exceeded 1MB, dropping (unterminated NDJSON line)")
                 this.#buf = ""
@@ -213,10 +204,11 @@ class SocketPool {
             this.#onDisconnect(socket)
         })
 
-        socket.on("error", (err) => {
+        const onSocketError = /** @param {NodeJS.ErrnoException} err */ (err) => {
             log.debug(`pool: socket error: ${err.code ?? err.message}`)
             this.#onDisconnect(socket)
-        })
+        }
+        socket.on("error", onSocketError)
 
         socket.on("close", (hadError) => {
             log.debug(`pool: socket close (hadError=${hadError})`)
@@ -237,7 +229,7 @@ class SocketPool {
         this.#buf = ""
 
         // Reject all pending requests
-        for (const [id, entry] of this.#pending) {
+        for (const entry of this.#pending.values()) {
             clearTimeout(entry.timer)
             entry.resolve(null)
         }
@@ -263,7 +255,7 @@ class SocketPool {
      * @param {string} op
      * @param {object} body
      * @param {number} timeoutMs
-     * @returns {Promise<object|null>}
+     * @returns {Promise<Record<string, any>|null>}
      */
     rpc(op, body, timeoutMs) {
         this.#ensureConnected()
@@ -328,7 +320,7 @@ class SocketPool {
             clearTimeout(this.#reconnectTimer)
             this.#reconnectTimer = null
         }
-        for (const [id, entry] of this.#pending) {
+        for (const entry of this.#pending.values()) {
             clearTimeout(entry.timer)
             entry.resolve(null)
         }
@@ -354,7 +346,7 @@ let _shortIdCounter = 0
  * @param {object} body
  * @param {number} timeoutMs
  * @param {{ wait?: boolean }} opts
- * @returns {Promise<object|null>}
+ * @returns {Promise<Record<string, any>|null>}
  */
 function rpc(op, body, timeoutMs, { wait = true } = {}) {
     const shortId = String(++_shortIdCounter).padStart(8, "0")
@@ -378,7 +370,7 @@ function rpc(op, body, timeoutMs, { wait = true } = {}) {
 class EventDebouncer {
     /** @type {Map<string, Array<{ type: string, properties: object, directory: string, worktree: string }>>} */
     #batches = new Map()
-    /** @type {Map<string, ReturnType<typeof setTimeout>>} */
+    /** @type {Map<string, number | ReturnType<typeof setTimeout>>} */
     #timers = new Map()
 
     /**
@@ -423,11 +415,11 @@ class EventDebouncer {
         if (batch.length === 1) {
             // Single event — send directly
             log.debug(`debounce: flush 1 event: ${batch[0].type}`)
-            rpc("event", batch[0], SHORT_TIMEOUT_MS, { wait: false })
+            void rpc("event", batch[0], SHORT_TIMEOUT_MS, { wait: false })
         } else {
             // Batched — send as batch event
             log.debug(`debounce: flush ${batch.length} events: ${batch.map(e => e.type).join(",")}`)
-            rpc("event", { type: "event.batch", events: batch }, SHORT_TIMEOUT_MS, { wait: false })
+            void rpc("event", { type: "event.batch", events: batch }, SHORT_TIMEOUT_MS, { wait: false })
         }
     }
 }

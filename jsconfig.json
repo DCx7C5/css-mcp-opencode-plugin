@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "target": "esnext",
+    "lib": ["esnext"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "checkJs": false,
+    "types": ["node"],
+    "strict": false
+  },
+  "include": ["socket-bridge.js"]
+}

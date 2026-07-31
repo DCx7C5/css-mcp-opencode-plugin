@@ -15,6 +15,9 @@ build/
 *.swp
 *.swo
 
+# Node
+node_modules/
+
 # OS
 .DS_Store
 Thumbs.db
@@ -30,7 +33,6 @@ htmlcov/
 
 # uv
 .python-version
-.aiignore
 
 # Secrets / local env
 .env

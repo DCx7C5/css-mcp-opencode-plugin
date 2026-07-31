@@ -19,5 +19,8 @@
     "mcp",
     "bridge"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^26.1.2"
+  }
 }
