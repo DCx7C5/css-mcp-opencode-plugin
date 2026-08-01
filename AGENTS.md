@@ -51,7 +51,8 @@ Key semantics (do not regress):
 - Bootstrap queue-until-capabilities (hooks before handshake are queued; queue deadline exceeded → fail-closed for blocking ops).
 - Capability-gated hooks: `bootstrap` reply carries `capabilities` (pre/post/shellEnv/context/eventPipeline); a hook whose capability is **not** registered skips its RPC and proceeds immediately (deterministic fast path). Re-applied per reconnect; `capabilities.update` push re-applies live.
 - Push dispatch happens BEFORE orphan matching in the data handler.
-- One authority per event: `pre` = tool.execute.before only; `permission` = permission.ask only; `event.pipeline` informational (branch depends on spike verdict).
+- One authority per event: `pre` = tool.execute.before only; `permission` = permission.ask only; `event.pipeline` informational (H3 spike verdict: host never awaits event hooks, thrown hook errors swallowed).
+- `session.inject` consumer: `client.session.promptAsync` (SDK `gen/sdk.gen.d.ts` line 182, `SessionPromptAsyncData` = `{body:{parts, messageID?, model?, agent?, noReply?, system?, tools?}, path:{id}, query:{directory?}}` → POST `/session/{id}/prompt_async`); `client.session.prompt` = `{body:{parts,...}, path:{id}}` → POST `/session/{id}/message`. Phase 3 should verify both in the installed SDK at runtime.
 - Bootstrap overrides mutate a mutable `runtimeConfig` object (all hooks read it at call time), re-applied per reconnect.
 - Config deltas at bootstrap only (config hook is load-only); runtime config.update push channel DROPPED.
 
@@ -72,8 +73,8 @@ Key semantics (do not regress):
 
 - [done] PUBLISHABILITY — package.json, LICENSE, README, git init
 - [done] BOOTSTRAP CAPABILITY-GATING — handshake at load + reconnect, capability-gated hooks (fast path when not registered), `capabilities.update` push, fail-closed for blocking ops on failed handshake
-- [running] SPIKE — event-hook await semantics (bgagent `0454c468`; gates event.pipeline branch)
-- [pending] Spec v0.4 finalization (spike verdict picks the H2/H3 branch) + rubber-duck re-gate
+- [done] SPIKE — event-hook await semantics → **H3**: host does NOT await `event` hooks (47 plugin.added invocations in ~250ms with 4s sleeps pending; run completed 3.1s with ~344s of pending sleeps; thrown hook errors logged + swallowed, exit 0). `event.pipeline` is informational only — never a blocking authority.
+- [done] Spec v0.4 finalization — H3 branch locked by spike verdict (event.pipeline informational; pre/permission remain the only blocking authorities). Rubber-duck re-gate pending on Phase 2.
 - [pending] Phase 2 — JS FIX #1–#6 (reply-expectation, deadline retry, server dedupe, #onDisconnect batch semantics, push-before-orphan, maxPending)
 - [pending] Phase 3 — shim rewrite: bootstrap handshake + capabilities, permission.ask hook, task authority, config deltas, session.inject consumer (verify `client.session.prompt`/`paste` in installed `@opencode-ai/sdk`)
 - Note: the Python brain (socket server, permission module, TaskManager, MCP tools, A2A ingestion) is **out of repo scope** — implement it externally or as a separate project.

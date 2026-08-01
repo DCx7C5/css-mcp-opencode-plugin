@@ -70,7 +70,7 @@ const okReply = (msg) => (msg && msg.ok === true ? msg : null)
  *   post           — tool.execute.after (non-blocking enrichment)
  *   shellEnv       — shell.env
  *   context        — experimental.session.compacting + event context syncs
- *   eventPipeline  — event.pipeline (H2/H3 verdict: blocking vs informational)
+ *   eventPipeline  — event.pipeline (H3 verdict: informational only)
  *
  * A capability defaults to `false`; when `false` the hook skips its RPC and
  * proceeds immediately (the deterministic fast path — "empty → just go").
@@ -821,7 +821,9 @@ export const PythonBridge = async ({ client, directory, worktree, project }) => 
                     return
                 }
                 // Synchronous pipeline: pre-hooks → store → post-hooks.
-                // Blocks OpenCode's event loop until the Python pipeline returns.
+                // The host never awaits event hooks (H3 spike verdict), so
+                // this RPC runs to its own deadline without blocking
+                // OpenCode's event loop; results are informational only.
                 const result = okReply(await rpc(
                     "event.pipeline",
                     { type, properties, directory, worktree },
