@@ -6,10 +6,13 @@
  * Logs go to stderr (opencode captures it).
  *
  * Architecture:
- *   - Persistent connection pool: one shared socket, reconnected on failure
- *   - Request/response multiplexing by UUID
+ *  - Persistent connection pool: one shared socket, reconnected on failure
+ *  - Request/response multiplexing by UUID
  *  - Event debouncing for rapid fire-and-forget events
- *  - Fail-closed by default for blocking ops (OPENCODE_FAIL_OPEN === "1" to opt in)
+ *  - Blocking ops fail closed only AFTER a brain ever connected
+ *    (OPENCODE_FAIL_OPEN === "1" to opt out). With no brain ever connected
+ *    the bridge is inert: every hook proceeds normally, so loading the
+ *    plugin without a Python server leaves opencode fully functional.
  */
 
 import net from "node:net"
@@ -85,8 +88,10 @@ const okReply = (msg) => (msg && msg.ok === true ? msg : null)
  *
  * A capability defaults to `false`; when `false` the hook skips its RPC and
  * proceeds immediately (the deterministic fast path — "empty → just go").
- * A *failed* bootstrap handshake still fail-closes blocking ops (`pre`,
- * `permission`) unless OPENCODE_FAIL_OPEN=1.
+ * A *failed* bootstrap handshake fail-closes blocking ops (`pre`,
+ * `permission`) only when the brain was previously connected; if no brain
+ * ever connected the bridge runs inert (all hooks proceed normally) unless
+ * OPENCODE_FAIL_OPEN=1.
  */
 const CAPABILITY_KEYS = ["pre", "permission", "post", "shellEnv", "context", "eventPipeline"]
 
@@ -133,6 +138,16 @@ let bootstrapGen = 0
  */
 let runtimeConfig = {}
 
+/** True once the bootstrap handshake ever succeeded. While false, a failed
+ * handshake means "no Python brain is present" → the bridge runs inert (all
+ * hooks proceed normally). Once true, a later handshake failure fail-closes
+ * blocking ops: an authority that vanished must not silently become
+ * permissive. */
+let everReady = false
+
+/** One-time warn that the bridge is running inert (no brain ever connected). */
+let warnedInert = false
+
 /**
  * Run (or re-run) the bootstrap handshake. Re-applied on every reconnect:
  * the caps set is replaced wholesale by the newest reply, and all hooks read
@@ -149,6 +164,7 @@ function startBootstrap() {
         if (gen !== bootstrapGen) return
         bootstrapInFlight = false
         if (msg && msg.ok === true && msg.capabilities && typeof msg.capabilities === "object") {
+            everReady = true
             bootstrap.caps = new Set(
                 CAPABILITY_KEYS.filter((key) => msg.capabilities[key] === true),
             )
@@ -160,7 +176,11 @@ function startBootstrap() {
             log.debug(`bootstrap: ready caps=[${[...bootstrap.caps].join(",") || "none"}]`)
         } else {
             bootstrap.status = "failed"
-            log.warn("bootstrap: failed — blocking ops fail-closed")
+            if (everReady) {
+                log.warn("bootstrap: failed — brain lost, blocking ops fail-closed")
+            } else {
+                log.warn("bootstrap: no Python brain connected — bridge inert, all hooks proceed normally")
+            }
         }
         settleBootstrap()
     })
@@ -169,13 +189,25 @@ function startBootstrap() {
 /**
  * Gate a *blocking* op (e.g. `pre`) on the handshake + capability.
  * @param {string} capKey
- * @returns {Promise<{kind: "rpc"} | {kind: "skip"} | {kind: "failed"}>}
+ * @returns {Promise<{kind: "rpc"} | {kind: "skip"} | {kind: "inert"} | {kind: "failed"}>}
  */
 async function gateBlocking(capKey) {
     if (bootstrap.status === "pending") await awaitBootstrap()
     if (bootstrap.status === "ready" && bootstrap.caps.has(capKey)) return { kind: "rpc" }
     if (bootstrap.status === "ready") return { kind: "skip" }
+    // Handshake failed. Distinguish "no brain ever connected" — bridge is
+    // inert, proceed normally (opencode fully functional without Python) —
+    // from "brain connected then vanished" — fail closed.
+    if (!everReady) return { kind: "inert" }
     return { kind: "failed" }
+}
+
+/** Warn once when the bridge proceeds without any authority (no brain ever
+ * connected). Used by blocking hooks on the inert path. */
+function warnInert() {
+    if (warnedInert) return
+    warnedInert = true
+    log.warn("bridge inert: no Python brain ever connected — proceeding without authority")
 }
 
 /** Gate a *non-blocking* op: skip its RPC unless the capability is registered. */
@@ -803,7 +835,7 @@ export const server = async ({ client, directory, worktree, project }) => {
         }
     } catch (err) {
         log.warn(`socket path not accessible: ${SOCKET_PATH} — ${err.code ?? err.message}`)
-        log.warn("hook calls will timeout until the Python server creates the socket")
+        log.warn("bridge loads inert: all hooks proceed normally until a Python brain connects")
     }
 
     // Kick off the bootstrap handshake immediately so the first hook call
@@ -840,6 +872,12 @@ export const server = async ({ client, directory, worktree, project }) => {
             if (gate.kind === "skip") {
                 // Brain is up but has no pre capability → proceed immediately.
                 log.debug(`pre-hook: brain has no pre capability, allowing tool=${input.tool}`)
+                return
+            }
+            if (gate.kind === "inert") {
+                // No brain ever connected → plugin is a no-op; proceed normally.
+                warnInert()
+                log.debug(`pre-hook: inert, allowing tool=${input.tool}`)
                 return
             }
             if (gate.kind === "failed") {
@@ -930,6 +968,12 @@ export const server = async ({ client, directory, worktree, project }) => {
                 // Brain is up but has no permission capability → proceed with
                 // the default ask flow (deterministic fast path).
                 log.debug("permission.ask: brain has no permission capability, default ask")
+                return
+            }
+            if (gate.kind === "inert") {
+                // No brain ever connected → plugin is a no-op; default ask.
+                warnInert()
+                log.debug("permission.ask: inert, default ask")
                 return
             }
             if (gate.kind === "failed") {

@@ -6,7 +6,8 @@ Unix socket; all decision logic lives in a Python "brain".
 **Architecture: Python brain, JS gate.**
 
 - **JS plugin** (`socket-bridge.js`) — persistent pooled Unix-socket transport,
-  NDJSON request/response, event debouncing, fail-closed blocking hooks.
+  NDJSON request/response, event debouncing, blocking hooks that fail closed
+  only after a Python brain has connected.
 - **Python brain** — *not part of this repo.* It is an external server that
   listens on the socket and owns permission rules, task management, event
   classification, and content injection. Test the transport with
@@ -22,11 +23,18 @@ handles (`capabilities`). Each hook then consults that declaration:
 - capability registered → send the RPC (with the op's own timeout)
 - capability **not** registered → skip the RPC and proceed immediately
   (deterministic fast path — no stall, no fake timeout)
-- bootstrap failed (brain unreachable) → blocking ops (`pre`, `permission`)
-  **fail closed**; non-blocking ops skip.
+- bootstrap failed with **no brain ever connected** → the bridge runs **inert**:
+  every hook proceeds, so opencode is fully functional without Python.
+- bootstrap failed **after a brain connected and vanished** → blocking ops
+  (`pre`, `permission`) **fail closed**; non-blocking ops skip. This keeps an
+  authority that disappeared from silently becoming permissive; opt out with
+  `OPENCODE_FAIL_OPEN=1`.
 
-Blocking hooks **fail closed** by default: if the Python brain is unreachable,
-the tool call is denied rather than allowed. Non-blocking hooks fail open.
+Blocking hooks (`pre`, `permission`) fail closed **only after a brain ever
+connected** — if the Python brain disappears, the next tool call / permission
+prompt is denied rather than allowed. If no brain ever connected, the plugin
+is a no-op: opencode runs exactly as if the plugin weren't loaded. Non-blocking
+hooks fail open.
 
 ## Install
 
@@ -67,11 +75,13 @@ opencode** (config is load-only).
 | `OPENCODE_POST_TIMEOUT` | `8000` |
 | `OPENCODE_CTX_TIMEOUT` | `3000` |
 | `OPENCODE_PIPELINE_TIMEOUT` | `10000` |
-| `OPENCODE_FAIL_OPEN` | unset → fail-closed; `"1"` → fail open |
+| `OPENCODE_FAIL_OPEN` | never-connected → inert; lost brain: unset → fail-closed, `"1"` → fail open |
 | `OPENCODE_BRIDGE_DEBUG` | unset / `"1"` |
 
-Without a Python brain running, keep `OPENCODE_FAIL_OPEN=1` exported — every
-blocking op would otherwise time out and block the tool.
+Loading the plugin without a Python brain is **safe and inert**: opencode runs
+normally (blocking hooks proceed, permissions keep their default ask flow)
+until a brain connects and takes over authority. If that brain is later lost,
+blocking ops fail closed again unless `OPENCODE_FAIL_OPEN=1`.
 
 ## Protocol
 
