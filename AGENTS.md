@@ -49,6 +49,7 @@ Key semantics (do not regress):
 - One deadline per rpc; rpcs survive reconnect until their own deadline; circuit breaker (N failed reconnects) rejects pending once.
 - Server-side callID dedupe (LRU ~1000, TTL 30s) prevents replay double-apply.
 - Bootstrap queue-until-capabilities (hooks before handshake are queued; queue deadline exceeded → fail-closed for blocking ops).
+- Capability-gated hooks: `bootstrap` reply carries `capabilities` (pre/post/shellEnv/context/eventPipeline); a hook whose capability is **not** registered skips its RPC and proceeds immediately (deterministic fast path). Re-applied per reconnect; `capabilities.update` push re-applies live.
 - Push dispatch happens BEFORE orphan matching in the data handler.
 - One authority per event: `pre` = tool.execute.before only; `permission` = permission.ask only; `event.pipeline` informational (branch depends on spike verdict).
 - Bootstrap overrides mutate a mutable `runtimeConfig` object (all hooks read it at call time), re-applied per reconnect.
@@ -69,9 +70,9 @@ Key semantics (do not regress):
 
 ## Current status / TODOs
 
-- [running] SPIKE — event-hook await semantics (bgagent `045ec89b`; gates event.pipeline branch)
-- [running] JS TRANSPORT HARDENING v2 — C1 ok:false validation, C2a fail-closed default, H1 timer leak, M1 idempotent #onDisconnect, #7 isFinite parse+pre 5s, #8 SHORT_TIMEOUT_MS, #9 end/destroyed guard, #10 dead branch removal, #11 short-id counter, #buf cap (bgagent `045ec0f1`)
-- [running] PUBLISHABILITY — package.json, LICENSE, README, git init (bgagent `045e51bf`)
+- [done] PUBLISHABILITY — package.json, LICENSE, README, git init
+- [done] BOOTSTRAP CAPABILITY-GATING — handshake at load + reconnect, capability-gated hooks (fast path when not registered), `capabilities.update` push, fail-closed for blocking ops on failed handshake
+- [running] SPIKE — event-hook await semantics (bgagent `0454c468`; gates event.pipeline branch)
 - [pending] Spec v0.4 finalization (spike verdict picks the H2/H3 branch) + rubber-duck re-gate
 - [pending] Phase 2 — JS FIX #1–#6 (reply-expectation, deadline retry, server dedupe, #onDisconnect batch semantics, push-before-orphan, maxPending)
 - [pending] Phase 3 — shim rewrite: bootstrap handshake + capabilities, permission.ask hook, task authority, config deltas, session.inject consumer (verify `client.session.prompt`/`paste` in installed `@opencode-ai/sdk`)
@@ -89,7 +90,7 @@ Key semantics (do not regress):
 
 ## Files
 
-- `socket-bridge.js` — the JS plugin (663-line baseline, being hardened)
+- `socket-bridge.js` — the JS plugin (852-line baseline incl. bootstrap capability-gating)
 - `package.json` — npm-publishable plugin metadata (`main: socket-bridge.js`)
 - `AGENTS.md` — this file
 - `README.md` — user-facing usage (npm / github URL / local symlink)
@@ -103,6 +104,7 @@ Key semantics (do not regress):
 | var | default |
 |-----|---------|
 | OPENCODE_PYTHON_SOCK | /var/run/css-mcp/hooks.sock |
+| OPENCODE_BOOTSTRAP_TIMEOUT | 5000 |
 | OPENCODE_PRE_TIMEOUT | 5000 |
 | OPENCODE_POST_TIMEOUT | 8000 |
 | OPENCODE_CTX_TIMEOUT | 3000 |

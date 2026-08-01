@@ -25,6 +25,7 @@ const parseTimeout = (env, fallback) => {
     return Number.isFinite(v) && v >= 0 ? v : fallback
 }
 
+const BOOTSTRAP_TIMEOUT_MS = parseTimeout(process.env.OPENCODE_BOOTSTRAP_TIMEOUT, 5_000)
 const PRE_TIMEOUT_MS = parseTimeout(process.env.OPENCODE_PRE_TIMEOUT, 5_000)
 const POST_TIMEOUT_MS = parseTimeout(process.env.OPENCODE_POST_TIMEOUT, 8_000)
 const CTX_TIMEOUT_MS = parseTimeout(process.env.OPENCODE_CTX_TIMEOUT, 3_000)
@@ -58,6 +59,121 @@ const log = {
  * @returns {Record<string, any>|null}
  */
 const okReply = (msg) => (msg && msg.ok === true ? msg : null)
+
+// ── bootstrap / capabilities ─────────────────────────────────────────
+
+/**
+ * Hook capabilities the Python brain may register during the bootstrap
+ * handshake. Each key maps to the hook that consults it:
+ *
+ *   pre            — tool.execute.before (blocking gate)
+ *   post           — tool.execute.after (non-blocking enrichment)
+ *   shellEnv       — shell.env
+ *   context        — experimental.session.compacting + event context syncs
+ *   eventPipeline  — event.pipeline (H2/H3 verdict: blocking vs informational)
+ *
+ * A capability defaults to `false`; when `false` the hook skips its RPC and
+ * proceeds immediately (the deterministic fast path — "empty → just go").
+ * A *failed* bootstrap handshake still fail-closes blocking ops (`pre`)
+ * unless OPENCODE_FAIL_OPEN=1.
+ */
+const CAPABILITY_KEYS = ["pre", "post", "shellEnv", "context", "eventPipeline"]
+
+/** @type {{ status: "pending"|"ready"|"failed", caps: Set<string> }} */
+let bootstrap = { status: "pending", caps: new Set() }
+
+/** True while a bootstrap RPC is in flight (guards load → connect double-fire). */
+let bootstrapInFlight = false
+
+/** Waiters parked until the bootstrap handshake settles. @type {Array<() => void>} */
+let bootstrapWaiters = []
+
+/** True when the named hook capability is currently registered. */
+const hasCap = (key) => bootstrap.status === "ready" && bootstrap.caps.has(key)
+
+/**
+ * Wait for the bootstrap handshake to settle (ready or failed).
+ * The wait is bounded by the bootstrap RPC's own deadline, so queued hooks
+ * cannot hang forever on a dead Python server.
+ * @returns {"ready"|"failed"}
+ */
+async function awaitBootstrap() {
+    if (bootstrap.status !== "pending") return bootstrap.status
+    await new Promise((resolve) => bootstrapWaiters.push(resolve))
+    return bootstrap.status
+}
+
+/** Release every hook queued on the handshake. */
+function settleBootstrap() {
+    const waiters = bootstrapWaiters
+    bootstrapWaiters = []
+    for (const resolve of waiters) resolve()
+}
+
+/** Monotonic generation: a newer handshake supersedes a stale one. */
+let bootstrapGen = 0
+
+/**
+ * Run (or re-run) the bootstrap handshake. Re-applied on every reconnect:
+ * the caps set is replaced wholesale by the newest reply, and all hooks read
+ * it at call time. No-op while a handshake is already in flight (guards the
+ * load → first-connect double-fire).
+ */
+function startBootstrap() {
+    if (bootstrapInFlight) return
+    bootstrapInFlight = true
+    const gen = ++bootstrapGen
+    bootstrap.status = "pending"
+    bootstrap.caps = new Set()
+    rpc("bootstrap", { protocol: "v0.4" }, BOOTSTRAP_TIMEOUT_MS).then((msg) => {
+        if (gen !== bootstrapGen) return
+        bootstrapInFlight = false
+        if (msg && msg.ok === true && msg.capabilities && typeof msg.capabilities === "object") {
+            bootstrap.caps = new Set(
+                CAPABILITY_KEYS.filter((key) => msg.capabilities[key] === true),
+            )
+            bootstrap.status = "ready"
+            log.debug(`bootstrap: ready caps=[${[...bootstrap.caps].join(",") || "none"}]`)
+        } else {
+            bootstrap.status = "failed"
+            log.warn("bootstrap: failed — blocking ops fail-closed")
+        }
+        settleBootstrap()
+    })
+}
+
+/**
+ * Gate a *blocking* op (e.g. `pre`) on the handshake + capability.
+ * @param {string} capKey
+ * @returns {Promise<{kind: "rpc"} | {kind: "skip"} | {kind: "failed"}>}
+ */
+async function gateBlocking(capKey) {
+    if (bootstrap.status === "pending") await awaitBootstrap()
+    if (bootstrap.status === "ready" && bootstrap.caps.has(capKey)) return { kind: "rpc" }
+    if (bootstrap.status === "ready") return { kind: "skip" }
+    return { kind: "failed" }
+}
+
+/** Gate a *non-blocking* op: skip its RPC unless the capability is registered. */
+const gateNonBlocking = (capKey) => hasCap(capKey)
+
+/**
+ * Handle a push from the Python server. Push dispatch runs BEFORE orphan
+ * matching in the pool data handler.
+ * @param {string} channel
+ * @param {object} body
+ */
+function handlePush(channel, body) {
+    if (channel === "capabilities.update" && body && typeof body === "object") {
+        bootstrap.caps = new Set(CAPABILITY_KEYS.filter((key) => body[key] === true))
+        bootstrap.status = "ready"
+        settleBootstrap()
+        log.debug(`push capabilities.update: caps=[${[...bootstrap.caps].join(",") || "none"}]`)
+        return
+    }
+    // session.inject / permissions.update consumers arrive in Phase 3.
+    log.debug(`push channel=${channel} (no consumer)`)
+}
 
 // ── tracked events ────────────────────────────────────────────────────
 
@@ -144,10 +260,21 @@ class SocketPool {
     #reconnectTimer = null
     /** @type {number} */
     #reconnectDelay = RECONNECT_BASE_MS
+    /** @type {(() => void) | null} — called after every successful connect */
+    #onConnect = null
 
     /** @param {string} path — UNIX socket path */
     constructor(path) {
         this.#path = path
+    }
+
+    /**
+     * Register a callback fired after every successful connect (initial and
+     * reconnects) — used to re-run the bootstrap handshake.
+     * @param {() => void} cb
+     */
+    set onConnect(cb) {
+        this.#onConnect = cb
     }
 
     /** Ensure we have a live connection.  No-op if already connected or connecting. */
@@ -168,6 +295,7 @@ class SocketPool {
             this.#connecting = false
             this.#reconnectDelay = RECONNECT_BASE_MS
             log.debug(`pool: connected (${this.#pending.size} pending)`)
+            this.#onConnect?.()
         })
 
         socket.on("data", (chunk) => {
@@ -184,6 +312,11 @@ class SocketPool {
                 if (!raw.trim()) continue
                 try {
                     const msg = JSON.parse(raw)
+                    if (msg && msg.type === "push") {
+                        // Push dispatch happens BEFORE orphan matching.
+                        handlePush(msg.channel, msg.body)
+                        continue
+                    }
                     const entry = this.#pending.get(msg.id)
                     if (entry) {
                         clearTimeout(entry.timer)
@@ -447,6 +580,11 @@ export const PythonBridge = async ({ client, directory, worktree, project }) => 
         log.warn("hook calls will timeout until the Python server creates the socket")
     }
 
+    // Kick off the bootstrap handshake immediately so the first hook call
+    // already knows the brain's capabilities. Re-applied on every reconnect.
+    pool.onConnect = startBootstrap
+    startBootstrap()
+
     try {
         await client?.app?.log?.({
             body: {
@@ -471,6 +609,25 @@ export const PythonBridge = async ({ client, directory, worktree, project }) => 
                 directory,
                 worktree,
             })
+
+            const gate = await gateBlocking("pre")
+            if (gate.kind === "skip") {
+                // Brain is up but has no pre capability → proceed immediately.
+                log.debug(`pre-hook: brain has no pre capability, allowing tool=${input.tool}`)
+                return
+            }
+            if (gate.kind === "failed") {
+                if (!FAIL_OPEN) {
+                    log.error(`pre-hook: BLOCKING tool=${input.tool} — python server unreachable (fail-closed)`)
+                    throw new Error(
+                        `Python pre-hook unreachable at ${SOCKET_PATH} — `
+                        + `tool "${input.tool}" blocked (fail-closed mode). `
+                        + `Set OPENCODE_FAIL_OPEN=1 to allow through.`,
+                    )
+                }
+                log.warn(`pre-hook: FAIL-OPEN tool=${input.tool} — python server unreachable, allowing through`)
+                return
+            }
 
             const decision = okReply(await rpc(
                 "pre",
@@ -520,6 +677,12 @@ export const PythonBridge = async ({ client, directory, worktree, project }) => 
                 worktree,
             })
 
+            if (!gateNonBlocking("post")) {
+                // Brain has no post capability → leave output unchanged.
+                log.debug(`post-hook: brain has no post capability, leaving output unchanged`)
+                return
+            }
+
             const decision = okReply(await rpc(
                 "post",
                 {
@@ -566,6 +729,12 @@ export const PythonBridge = async ({ client, directory, worktree, project }) => 
                 worktree,
             })
 
+            if (!gateNonBlocking("shellEnv")) {
+                // Brain has no shell-env capability → env unchanged.
+                log.debug("shell-env: brain has no shellEnv capability, env unchanged")
+                return
+            }
+
             const reply = okReply(await rpc(
                 "shell-env",
                 {
@@ -592,6 +761,12 @@ export const PythonBridge = async ({ client, directory, worktree, project }) => 
         // ── session compaction context ────────────────────────────────
         "experimental.session.compacting": async (input, output) => {
             log.debug(`compacting: sessionID=${input?.sessionID}`)
+
+            if (!gateNonBlocking("context")) {
+                // Brain has no context capability → context unchanged.
+                log.debug("compacting: brain has no context capability, context unchanged")
+                return
+            }
 
             const reply = okReply(await rpc(
                 "context",
@@ -640,6 +815,11 @@ export const PythonBridge = async ({ client, directory, worktree, project }) => 
             log.debug(`event: type=${type} keys=${Object.keys(properties).join(",") || "none"}`)
 
             if (HOOKABLE_EVENTS.has(type)) {
+                if (!gateNonBlocking("eventPipeline")) {
+                    // Brain has no event.pipeline capability → skip pipeline.
+                    log.debug(`event: brain has no eventPipeline capability, skipping ${type}`)
+                    return
+                }
                 // Synchronous pipeline: pre-hooks → store → post-hooks.
                 // Blocks OpenCode's event loop until the Python pipeline returns.
                 const result = okReply(await rpc(
@@ -661,7 +841,7 @@ export const PythonBridge = async ({ client, directory, worktree, project }) => 
 
             // Context-trigger events sync relevant context into
             // STATE.live_context server-side.
-            if (CONTEXT_TRIGGER_EVENTS.has(type)) {
+            if (CONTEXT_TRIGGER_EVENTS.has(type) && gateNonBlocking("context")) {
                 log.debug(`event: syncing context for ${type}`)
                 rpc(
                     "context",

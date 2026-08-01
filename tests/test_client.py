@@ -127,7 +127,9 @@ def test_handle_request_bootstrap_reports_capabilities() -> None:
     assert reply is not None
     assert reply["id"] == "req-1"
     assert reply["ok"] is True
-    assert reply["capabilities"]["session.inject"] is True
+    caps = reply["capabilities"]
+    assert set(caps) == {"pre", "post", "shellEnv", "context", "eventPipeline"}
+    assert all(caps[key] is True for key in caps)
 
 
 def test_handle_request_shell_env_empty() -> None:

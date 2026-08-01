@@ -325,7 +325,8 @@ def handle_request(request: Request) -> dict[str, object] | None:
     - ``pre`` / ``permission``: ``allow: true`` (never denies)
     - ``shell-env``: ``env: {}`` (nothing to inject)
     - ``event.pipeline``: ``hooks_ran: []`` (never blocks)
-    - ``bootstrap``: a ``capabilities`` map
+    - ``bootstrap``: a hook-``capabilities`` map (``pre``/``post``/``shellEnv``/
+      ``context``/``eventPipeline`` — the keys socket-bridge.js gates on)
     - ``config``, ``post``, ``context``: bare ``ok: true``
 
     Args:
@@ -339,9 +340,11 @@ def handle_request(request: Request) -> dict[str, object] | None:
     reply: dict[str, object] = {"id": request.id, "ok": True}
     if request.op == "bootstrap":
         reply["capabilities"] = {
-            "permissions": True,
-            "tasks": True,
-            "session.inject": True,
+            "pre": True,
+            "post": True,
+            "shellEnv": True,
+            "context": True,
+            "eventPipeline": True,
         }
     elif request.op in {"pre", "permission"}:
         reply["allow"] = True
