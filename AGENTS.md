@@ -12,7 +12,7 @@ OpenCode ↔ Python bridge. The JS plugin (`socket-bridge.js`) is a thin transpo
 2. **Permission management from Python** — `permission.ask` hook + MCP `permissions_add/update/list` tools; mirror OpenCode semantics (keys `read/edit/glob/grep/bash/task/skill/lsp/question/webfetch/websearch/external_directory/doom_loop`, values `allow|ask|deny`, last-match-wins, `*`/`?` wildcards, per-tool object syntax, `~`/`$HOME` expansion).
 3. **Full task-tool authority from Python** — pre-hook gate on `tool==="task"` + in-process async TaskManager exposed via MCP `task_create/list/output/cancel/clear`.
 4. **Live content injection** — `session.inject` push channel → JS consumer calls `client.session` API → enables A2A message injection into the active session.
-5. **Loadable plugin** — npm-publishable package (`package.json` at root); `github:user/repo` URL loading works once opencode#12378 is fixed.
+5. **Loadable plugin** — npm-publishable package (`package.json` at root); `github:user/repo` URL loading verified on opencode ≥ 1.18.4 (`opencode plugin github:owner/repo`).
 
 ## Architecture
 
@@ -88,7 +88,7 @@ Key semantics (do not regress):
 - No plugin API launches subagents → pre-hook authority over `tool==="task"` (Python-side TaskManager tools are out of repo scope).
 - `config` hook mutates only at load → Python supplies config deltas at bootstrap; runtime `config.update` push channel dropped.
 - `session.inject` push channel added for live content injection / A2A (new in v0.4).
-- GitHub URL plugin loading is an open feature request (opencode#8264/#12378) — npm publish is the supported path.
+- GitHub URL plugin loading **verified working** on opencode ≥ 1.18.4: `opencode plugin github:owner/repo` installs from the repo (bun snapshot into `~/.cache/opencode/packages/`), detects the `server` target, and updates the project config. npm publish remains the alternative for versioned distribution.
 
 ## Files
 

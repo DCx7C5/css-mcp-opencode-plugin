@@ -50,8 +50,10 @@ npm install css-mcp-opencode-plugin
 "plugin": ["github:DCx7C5/css-mcp-opencode-plugin"]
 ```
 
-> Note: GitHub URL plugin loading requires opencode#12378 to be fixed. npm
-> publish is the supported path.
+> GitHub URL plugin loading is verified on opencode ≥ 1.18.4: `opencode plugin
+> github:DCx7C5/css-mcp-opencode-plugin` installs the repo, detects the
+> `server` target, and updates the project config. npm publish remains the
+> alternative for versioned distribution.
 
 ### Local symlink (development)
 
