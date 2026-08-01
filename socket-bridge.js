@@ -638,8 +638,13 @@ class EventDebouncer {
 const debouncer = new EventDebouncer()
 
 // ── plugin entry point ────────────────────────────────────────────────
+// Named export MUST be `server` (the PluginModule shape
+// `{ id?, server, tui? }` from @opencode-ai/plugin): opencode's loader
+// resolves `module.server` for config/npm plugins. An arbitrary name
+// (e.g. the old `PythonBridge`) is never read — the plugin would load
+// but no hooks would run.
 
-export const PythonBridge = async ({ client, directory, worktree, project }) => {
+export const server = async ({ client, directory, worktree, project }) => {
     log.info(
         `loading — socket=${SOCKET_PATH} failOpen=${FAIL_OPEN} debug=${DEBUG}`,
     )

@@ -16,7 +16,7 @@ OpenCode ↔ Python bridge. The JS plugin (`socket-bridge.js`) is a thin transpo
 
 ## Architecture
 
-- `socket-bridge.js` (repo root, ESM): OpenCode plugin, V1 named export `PythonBridge = async ({client, directory, worktree, project}) => hooks`. SocketPool = one shared Unix socket, UUID-multiplexed RPC, reconnect with backoff, event debouncing, push handling.
+- `socket-bridge.js` (repo root, ESM): OpenCode plugin, named export `server = async ({client, directory, worktree, project}) => hooks` (the `PluginModule` shape `{id?, server, tui?}` from `@opencode-ai/plugin` — opencode resolves `module.server` for config/npm plugins; an arbitrary export name is never loaded). SocketPool = one shared Unix socket, UUID-multiplexed RPC, reconnect with backoff, event debouncing, push handling.
 - Python brain: **not part of this repo** (the `mcps/css-mcp` package was removed). The socket transport still expects an external server at `/var/run/css-mcp/hooks.sock`; without one, blocking ops fail closed. Test the transport with `scripts/client.py`.
 - Socket: `/var/run/css-mcp/hooks.sock` (`OPENCODE_PYTHON_SOCK` override), NDJSON `\n`-delimited, UTF-8.
 - Two channels: **socket** (JS↔Py) and **MCP stdio** (OpenCode↔Py).
