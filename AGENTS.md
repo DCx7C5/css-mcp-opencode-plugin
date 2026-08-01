@@ -49,10 +49,10 @@ Key semantics (do not regress):
 - One deadline per rpc; rpcs survive reconnect until their own deadline; circuit breaker (N failed reconnects) rejects pending once.
 - Server-side callID dedupe (LRU ~1000, TTL 30s) prevents replay double-apply.
 - Bootstrap queue-until-capabilities (hooks before handshake are queued; queue deadline exceeded → fail-closed for blocking ops).
-- Capability-gated hooks: `bootstrap` reply carries `capabilities` (pre/post/shellEnv/context/eventPipeline); a hook whose capability is **not** registered skips its RPC and proceeds immediately (deterministic fast path). Re-applied per reconnect; `capabilities.update` push re-applies live.
+- Capability-gated hooks: `bootstrap` reply carries `capabilities` (pre/permission/post/shellEnv/context/eventPipeline); a hook whose capability is **not** registered skips its RPC and proceeds immediately (deterministic fast path). Re-applied per reconnect; `capabilities.update` push re-applies live.
 - Push dispatch happens BEFORE orphan matching in the data handler.
 - One authority per event: `pre` = tool.execute.before only; `permission` = permission.ask only; `event.pipeline` informational (H3 spike verdict: host never awaits event hooks, thrown hook errors swallowed).
-- `session.inject` consumer: `client.session.promptAsync` (SDK `gen/sdk.gen.d.ts` line 182, `SessionPromptAsyncData` = `{body:{parts, messageID?, model?, agent?, noReply?, system?, tools?}, path:{id}, query:{directory?}}` → POST `/session/{id}/prompt_async`); `client.session.prompt` = `{body:{parts,...}, path:{id}}` → POST `/session/{id}/message`. Phase 3 should verify both in the installed SDK at runtime.
+- `session.inject` consumer: `client.session.promptAsync` (SDK `gen/sdk.gen.d.ts` line 182, `SessionPromptAsyncData` = `{body:{parts, messageID?, model?, agent?, noReply?, system?, tools?}, path:{id}, query:{directory?}}` → POST `/session/{id}/prompt_async`); `client.session.prompt` = `{body:{parts,...}, path:{id}}` → POST `/session/{id}/message`. Verified in the installed SDK at runtime: `SessionInjector` delivers synthetic text parts with `noReply: true`, FIFO per session, dedupe by id, fail-safe on client error / null client.
 - Bootstrap overrides mutate a mutable `runtimeConfig` object (all hooks read it at call time), re-applied per reconnect.
 - Config deltas at bootstrap only (config hook is load-only); runtime config.update push channel DROPPED.
 
@@ -76,7 +76,7 @@ Key semantics (do not regress):
 - [done] SPIKE — event-hook await semantics → **H3**: host does NOT await `event` hooks (47 plugin.added invocations in ~250ms with 4s sleeps pending; run completed 3.1s with ~344s of pending sleeps; thrown hook errors logged + swallowed, exit 0). `event.pipeline` is informational only — never a blocking authority.
 - [done] Spec v0.4 finalization — H3 branch locked by spike verdict (event.pipeline informational; pre/permission remain the only blocking authorities). Rubber-duck re-gate pending on Phase 2.
 - [done] Phase 2 — JS FIX #1–#6 (reply-expectation via `NO_REPLY_OPS` + `pool.send()`, deadline retry — rpcs survive reconnect to their own deadline, server dedupe via `ReplayCache` LRU in client.py, `#onDisconnect` batch semantics via circuit breaker after 3 failed reconnect cycles, push-before-orphan, maxPending 256). E2E verified: NO_REPLY event leaves no pending entry, pre survives reconnect, pre fails closed fast (breaker) when brain gone; `socket-bridge.js` assigns `#socket` at create so failed connects still pass the disconnect guard.
-- [pending] Phase 3 — shim rewrite: bootstrap handshake + capabilities, permission.ask hook, task authority, config deltas, session.inject consumer (verify `client.session.prompt`/`paste` in installed `@opencode-ai/sdk`)
+- [done] Phase 3 — JS shim features: `permission.ask` hook (permission authority, capability-gated, fail-closed deny on unreachable brain, `status: allow|ask|deny` reply with `{allow: bool}` back-compat), task-tool authority (pre-hook surfaces `task` subagent fields explicitly to the TaskManager gate), config deltas at bootstrap (`runtimeConfig` mutable object replaced wholesale per handshake/reconnect, also via `capabilities.update` push), `session.inject` consumer (`SessionInjector`: FIFO per session, dedupe by id, bounded window, `client.session.promptAsync` with synthetic text parts + `noReply: true`, fail-safe on client error / null client). E2E-verified: permission deny propagates, inject FIFO + dedupe + fail-safe.
 - Note: the Python brain (socket server, permission module, TaskManager, MCP tools, A2A ingestion) is **out of repo scope** — implement it externally or as a separate project.
 
 ## Known decisions (do not reverse without discussion)
@@ -107,6 +107,7 @@ Key semantics (do not regress):
 | OPENCODE_PYTHON_SOCK | /var/run/css-mcp/hooks.sock |
 | OPENCODE_BOOTSTRAP_TIMEOUT | 5000 |
 | OPENCODE_PRE_TIMEOUT | 5000 |
+| OPENCODE_PERMISSION_TIMEOUT | 5000 |
 | OPENCODE_POST_TIMEOUT | 8000 |
 | OPENCODE_CTX_TIMEOUT | 3000 |
 | OPENCODE_PIPELINE_TIMEOUT | 10000 |

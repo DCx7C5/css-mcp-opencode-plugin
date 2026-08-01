@@ -27,6 +27,7 @@ const parseTimeout = (env, fallback) => {
 
 const BOOTSTRAP_TIMEOUT_MS = parseTimeout(process.env.OPENCODE_BOOTSTRAP_TIMEOUT, 5_000)
 const PRE_TIMEOUT_MS = parseTimeout(process.env.OPENCODE_PRE_TIMEOUT, 5_000)
+const PERMISSION_TIMEOUT_MS = parseTimeout(process.env.OPENCODE_PERMISSION_TIMEOUT, 5_000)
 const POST_TIMEOUT_MS = parseTimeout(process.env.OPENCODE_POST_TIMEOUT, 8_000)
 const CTX_TIMEOUT_MS = parseTimeout(process.env.OPENCODE_CTX_TIMEOUT, 3_000)
 const PIPELINE_TIMEOUT_MS = parseTimeout(process.env.OPENCODE_PIPELINE_TIMEOUT, 10_000)
@@ -76,6 +77,7 @@ const okReply = (msg) => (msg && msg.ok === true ? msg : null)
  * handshake. Each key maps to the hook that consults it:
  *
  *   pre            — tool.execute.before (blocking gate)
+ *   permission     — permission.ask (blocking authority)
  *   post           — tool.execute.after (non-blocking enrichment)
  *   shellEnv       — shell.env
  *   context        — experimental.session.compacting + event context syncs
@@ -83,10 +85,10 @@ const okReply = (msg) => (msg && msg.ok === true ? msg : null)
  *
  * A capability defaults to `false`; when `false` the hook skips its RPC and
  * proceeds immediately (the deterministic fast path — "empty → just go").
- * A *failed* bootstrap handshake still fail-closes blocking ops (`pre`)
- * unless OPENCODE_FAIL_OPEN=1.
+ * A *failed* bootstrap handshake still fail-closes blocking ops (`pre`,
+ * `permission`) unless OPENCODE_FAIL_OPEN=1.
  */
-const CAPABILITY_KEYS = ["pre", "post", "shellEnv", "context", "eventPipeline"]
+const CAPABILITY_KEYS = ["pre", "permission", "post", "shellEnv", "context", "eventPipeline"]
 
 /** @type {{ status: "pending"|"ready"|"failed", caps: Set<string> }} */
 let bootstrap = { status: "pending", caps: new Set() }
@@ -123,6 +125,15 @@ function settleBootstrap() {
 let bootstrapGen = 0
 
 /**
+ * Mutable runtime configuration supplied by the Python brain at bootstrap.
+ * The `config` hook only mutates at load time, so config deltas travel via
+ * the bootstrap reply (and `capabilities.update` pushes); all hooks read
+ * this object at call time. Replaced wholesale per handshake/reconnect.
+ * @type {Record<string, any>}
+ */
+let runtimeConfig = {}
+
+/**
  * Run (or re-run) the bootstrap handshake. Re-applied on every reconnect:
  * the caps set is replaced wholesale by the newest reply, and all hooks read
  * it at call time. No-op while a handshake is already in flight (guards the
@@ -142,6 +153,10 @@ function startBootstrap() {
                 CAPABILITY_KEYS.filter((key) => msg.capabilities[key] === true),
             )
             bootstrap.status = "ready"
+            if (msg.config && typeof msg.config === "object") {
+                runtimeConfig = msg.config
+                log.debug(`bootstrap: config delta keys=[${Object.keys(runtimeConfig).join(",") || "none"}]`)
+            }
             log.debug(`bootstrap: ready caps=[${[...bootstrap.caps].join(",") || "none"}]`)
         } else {
             bootstrap.status = "failed"
@@ -166,6 +181,113 @@ async function gateBlocking(capKey) {
 /** Gate a *non-blocking* op: skip its RPC unless the capability is registered. */
 const gateNonBlocking = (capKey) => hasCap(capKey)
 
+// ── session.inject consumer ───────────────────────────────────────────
+
+/**
+ * Live content injection into an active session, driven by Python pushes
+ * (`session.inject`). FIFO per session, dedupe by message id, bounded queue,
+ * fail-safe on any client API error (log + drop, never throw into the
+ * push handler). Injected parts are synthetic text parts; the A2A message is
+ * authored by the Python brain, this side only pushes it into opencode.
+ *
+ * `client.session.promptAsync` (POST /session/{id}/prompt_async) starts the
+ * agent if needed and returns immediately — the right shape for injection
+ * (we never block the push handler on a full model turn).
+ */
+class SessionInjector {
+    /** @type {Map<string, Array<import("@opencode-ai/sdk").TextPartInput>>} */
+    #queues = new Map()
+    /** @type {Set<string>} — dedupe window for inject ids (LRU-ish, bounded). */
+    #seen = new Set()
+    /** @type {Array<string>} — FIFO of ids for bounded eviction. */
+    #seenOrder = []
+    /** @type {Set<string>} — sessions with an in-flight inject. */
+    #inFlight = new Set()
+
+    /**
+     * Queue one injection for delivery to its session.
+     * @param {object} body — {id, sessionID, kind, content, metadata}
+     * @param {{ session: import("@opencode-ai/sdk").SdkClient }} client
+     */
+    push(body, client) {
+        if (!body || typeof body !== "object") return
+        const { id, sessionID, kind, content, metadata } = body
+        if (!id || !sessionID || typeof content !== "string") {
+            log.warn(`session.inject: invalid body (id=${id} sessionID=${sessionID})`)
+            return
+        }
+        if (this.#seen.has(id)) {
+            log.debug(`session.inject: dedupe id=${id.slice(0, 8)}`)
+            return
+        }
+        if (!["user", "assistant", "system"].includes(kind)) {
+            log.warn(`session.inject: unknown kind=${kind} id=${id.slice(0, 8)}`)
+            return
+        }
+        this.#remember(id)
+
+        const part = {
+            type: "text",
+            text: content,
+            synthetic: true,
+            ...(metadata && typeof metadata === "object" ? { metadata } : {}),
+        }
+        if (!this.#queues.has(sessionID)) this.#queues.set(sessionID, [])
+        this.#queues.get(sessionID).push(part)
+        log.debug(`session.inject: queued id=${id.slice(0, 8)} kind=${kind} session=${sessionID.slice(0, 8)}`)
+
+        // Deliver asynchronously; the push handler must never block on it.
+        void this.#drain(sessionID, client)
+    }
+
+    /** Remember an inject id, evicting the oldest when the window overflows. */
+    #remember(id) {
+        this.#seen.add(id)
+        this.#seenOrder.push(id)
+        if (this.#seenOrder.length > MAX_PENDING) {
+            const oldest = this.#seenOrder.shift()
+            this.#seen.delete(oldest)
+        }
+    }
+
+    /**
+     * Drain one session's queue serially (FIFO): one in-flight inject per
+     * session. Any client error is logged and dropped (fail-safe).
+     * @param {string} sessionID
+     * @param {import("@opencode-ai/sdk").SdkClient} client
+     */
+    async #drain(sessionID, client) {
+        if (this.#inFlight.has(sessionID)) return
+        const queue = this.#queues.get(sessionID)
+        if (!queue || queue.length === 0) return
+        this.#inFlight.add(sessionID)
+
+        try {
+            while (this.#queues.get(sessionID)?.length) {
+                const parts = this.#queues.get(sessionID)
+                const part = parts.shift()
+                await client.session.promptAsync({
+                    body: {
+                        parts: [part],
+                        noReply: true,
+                    },
+                    path: { id: sessionID },
+                })
+                log.debug(`session.inject: delivered part to session=${sessionID.slice(0, 8)}`)
+            }
+            this.#queues.delete(sessionID)
+        } catch (err) {
+            // Fail-safe: log + drop; never throw into the push handler.
+            log.error(`session.inject: client error session=${sessionID.slice(0, 8)}: ${err.message}`)
+            this.#queues.delete(sessionID)
+        } finally {
+            this.#inFlight.delete(sessionID)
+        }
+    }
+}
+
+const injector = new SessionInjector()
+
 /**
  * Handle a push from the Python server. Push dispatch runs BEFORE orphan
  * matching in the pool data handler.
@@ -176,11 +298,20 @@ function handlePush(channel, body) {
     if (channel === "capabilities.update" && body && typeof body === "object") {
         bootstrap.caps = new Set(CAPABILITY_KEYS.filter((key) => body[key] === true))
         bootstrap.status = "ready"
+        if (body.config && typeof body.config === "object") {
+            runtimeConfig = body.config
+            log.debug(`push capabilities.update: config keys=[${Object.keys(runtimeConfig).join(",") || "none"}]`)
+        }
         settleBootstrap()
         log.debug(`push capabilities.update: caps=[${[...bootstrap.caps].join(",") || "none"}]`)
         return
     }
-    // session.inject / permissions.update consumers arrive in Phase 3.
+    if (channel === "session.inject" && body && typeof body === "object") {
+        injector.push(body, activeClient)
+        return
+    }
+    // permissions.update is informational on the JS side: permission rules
+    // live in the Python brain, so no consumer is needed here.
     log.debug(`push channel=${channel} (no consumer)`)
 }
 
@@ -637,6 +768,14 @@ class EventDebouncer {
 
 const debouncer = new EventDebouncer()
 
+/**
+ * The opencode SDK client from the active plugin instance. Set in `server()`;
+ * used by push consumers (`session.inject`) that fire from the pool data
+ * handler, outside the hook closure.
+ * @type {import("@opencode-ai/sdk").SdkClient}
+ */
+let activeClient = null
+
 // ── plugin entry point ────────────────────────────────────────────────
 // Named export MUST be `server` (the PluginModule shape
 // `{ id?, server, tui? }` from @opencode-ai/plugin): opencode's loader
@@ -648,6 +787,10 @@ export const server = async ({ client, directory, worktree, project }) => {
     log.info(
         `loading — socket=${SOCKET_PATH} failOpen=${FAIL_OPEN} debug=${DEBUG}`,
     )
+
+    // Keep the client for push consumers (session.inject) that fire outside
+    // the hook closures, from the pool data handler.
+    activeClient = client ?? null
 
     // Validate socket path exists at startup (best-effort)
     try {
@@ -720,6 +863,17 @@ export const server = async ({ client, directory, worktree, project }) => {
                     callID: input.callID,
                     args: output.args,
                     directory,
+                    // Task-tool authority: surface the subagent request fields
+                    // explicitly so the Python TaskManager gate can decide
+                    // without re-parsing opaque args.
+                    task: input.tool === "task"
+                        ? {
+                            prompt: output.args?.prompt,
+                            description: output.args?.description,
+                            agent: output.args?.agent ?? output.args?.subagent_type,
+                            model: output.args?.model,
+                        }
+                        : undefined,
                 },
                 PRE_TIMEOUT_MS,
             ))
@@ -747,6 +901,83 @@ export const server = async ({ client, directory, worktree, project }) => {
                 throw new Error(decision.reason || "Blocked by Python pre-hook")
             }
             log.debug(`pre-hook: ALLOWED tool=${input.tool}`)
+        },
+
+        // ── permission authority ──────────────────────────────────────
+        // `permission.ask` is a blocking authority: the Python brain decides
+        // allow / ask / deny for every permission prompt. Task-tool authority
+        // is handled by the pre-hook above (tool==="task" flows through the
+        // same gate with its full args) — no plugin API launches subagents,
+        // so Python's TaskManager rules live behind that gate.
+        "permission.ask": async (input, output) => {
+            log.debug(`permission.ask: type=${input.type} title="${input.title?.slice(0, 60)}"`)
+
+            debouncer.push({
+                type: "permission.asked",
+                properties: {
+                    type: input.type,
+                    pattern: input.pattern,
+                    sessionID: input.sessionID,
+                    callID: input.callID,
+                    title: input.title,
+                },
+                directory,
+                worktree,
+            })
+
+            const gate = await gateBlocking("permission")
+            if (gate.kind === "skip") {
+                // Brain is up but has no permission capability → proceed with
+                // the default ask flow (deterministic fast path).
+                log.debug("permission.ask: brain has no permission capability, default ask")
+                return
+            }
+            if (gate.kind === "failed") {
+                if (!FAIL_OPEN) {
+                    log.error("permission.ask: DENYING — python server unreachable (fail-closed)")
+                    output.status = "deny"
+                    return
+                }
+                log.warn("permission.ask: FAIL-OPEN — python server unreachable, default ask")
+                return
+            }
+
+            const decision = okReply(await rpc(
+                "permission",
+                {
+                    id: input.id,
+                    type: input.type,
+                    pattern: input.pattern,
+                    sessionID: input.sessionID,
+                    messageID: input.messageID,
+                    callID: input.callID,
+                    title: input.title,
+                    metadata: input.metadata,
+                    directory,
+                },
+                PERMISSION_TIMEOUT_MS,
+            ))
+
+            if (!decision) {
+                if (!FAIL_OPEN) {
+                    log.error("permission.ask: DENYING — python server unreachable (fail-closed)")
+                    output.status = "deny"
+                    return
+                }
+                log.warn("permission.ask: FAIL-OPEN — no reply, default ask")
+                return
+            }
+
+            // Brain reply: {status: "allow"|"ask"|"deny"} (v0.4), with
+            // backwards-compat {allow: bool} from the minimal test brain.
+            const status = decision.status
+                ?? (decision.allow === false ? "deny" : decision.allow === true ? "allow" : "ask")
+            if (status === "allow" || status === "ask" || status === "deny") {
+                log.debug(`permission.ask: brain says ${status} (${input.type})`)
+                output.status = status
+            } else {
+                log.warn(`permission.ask: unknown status=${status}, default ask`)
+            }
         },
 
         // ── post-hook ─────────────────────────────────────────────────

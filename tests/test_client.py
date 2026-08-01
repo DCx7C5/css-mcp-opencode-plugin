@@ -117,7 +117,7 @@ def test_handle_request_permission_allows() -> None:
     client = _load_client()
     request = client.Request(id="req-1", op="permission", body={})
     reply = client.handle_request(request)
-    assert reply == {"id": "req-1", "ok": True, "allow": True}
+    assert reply == {"id": "req-1", "ok": True, "status": "allow"}
 
 
 def test_handle_request_bootstrap_reports_capabilities() -> None:
@@ -128,7 +128,7 @@ def test_handle_request_bootstrap_reports_capabilities() -> None:
     assert reply["id"] == "req-1"
     assert reply["ok"] is True
     caps = reply["capabilities"]
-    assert set(caps) == {"pre", "post", "shellEnv", "context", "eventPipeline"}
+    assert set(caps) == {"pre", "permission", "post", "shellEnv", "context", "eventPipeline"}
     assert all(caps[key] is True for key in caps)
 
 

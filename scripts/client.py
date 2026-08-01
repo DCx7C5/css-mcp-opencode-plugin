@@ -366,11 +366,13 @@ def handle_request(request: Request) -> dict[str, object] | None:
     Every op except ``event`` gets an ``ok: true`` reply with a payload the
     plugin's hooks consume (see socket-bridge.js ``okReply`` contract):
 
-    - ``pre`` / ``permission``: ``allow: true`` (never denies)
+    - ``pre``: ``allow: true`` (never denies)
+    - ``permission``: ``status: "allow"`` (v0.4 protocol — never denies)
     - ``shell-env``: ``env: {}`` (nothing to inject)
     - ``event.pipeline``: ``hooks_ran: []`` (never blocks)
-    - ``bootstrap``: a hook-``capabilities`` map (``pre``/``post``/``shellEnv``/
-      ``context``/``eventPipeline`` — the keys socket-bridge.js gates on)
+    - ``bootstrap``: a hook-``capabilities`` map (``pre``/``permission``/``post``/
+      ``shellEnv``/``context``/``eventPipeline`` — the keys socket-bridge.js
+      gates on)
     - ``config``, ``post``, ``context``: bare ``ok: true``
 
     Args:
@@ -385,13 +387,16 @@ def handle_request(request: Request) -> dict[str, object] | None:
     if request.op == "bootstrap":
         reply["capabilities"] = {
             "pre": True,
+            "permission": True,
             "post": True,
             "shellEnv": True,
             "context": True,
             "eventPipeline": True,
         }
-    elif request.op in {"pre", "permission"}:
+    elif request.op == "pre":
         reply["allow"] = True
+    elif request.op == "permission":
+        reply["status"] = "allow"
     elif request.op == "shell-env":
         reply["env"] = {}
     elif request.op == "event.pipeline":
