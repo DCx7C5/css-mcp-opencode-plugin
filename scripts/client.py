@@ -50,7 +50,9 @@ import argparse
 import asyncio
 import os
 import sys
+import time
 import uuid
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -60,6 +62,11 @@ import msgspec
 DEFAULT_SOCKET = "/var/run/css-mcp/hooks.sock"
 
 DEFAULT_PUSH_INTERVAL = 5.0
+
+# Server-side dedupe limits (spec): replay double-apply is prevented by
+# remembering request ids briefly (LRU ~1000, TTL 30s).
+DEDUPE_CAPACITY = 1000
+DEDUPE_TTL = 30.0
 
 OPS: frozenset[str] = frozenset(
     {
@@ -105,6 +112,43 @@ class BridgeError(Exception):
 
 class ReplyTimeout(BridgeError):
     """Raised when the server does not reply within the deadline."""
+
+
+class ReplayCache:
+    """LRU cache of recently-seen request ids (TTL-bounded).
+
+    Prevents replay double-apply: when a request is re-sent with the same id
+    (e.g. the JS pool re-enqueues after a reconnect), the cached reply is
+    returned instead of re-running the handler.
+
+    Args:
+        capacity: Max ids retained before evicting the least-recently-used.
+        ttl: Seconds a cached entry is considered fresh.
+    """
+
+    def __init__(self, capacity: int = DEDUPE_CAPACITY, ttl: float = DEDUPE_TTL) -> None:
+        self.capacity = capacity
+        self.ttl = ttl
+        self._seen: OrderedDict[str, tuple[float, dict[str, object]]] = OrderedDict()
+
+    def get(self, request_id: str) -> dict[str, object] | None:
+        """Return the cached reply for a replayed id, or ``None`` if fresh."""
+        item = self._seen.get(request_id)
+        if item is None:
+            return None
+        seen_at, reply = item
+        if time.monotonic() - seen_at > self.ttl:
+            del self._seen[request_id]
+            return None
+        self._seen.move_to_end(request_id)
+        return reply
+
+    def put(self, request_id: str, reply: dict[str, object]) -> None:
+        """Remember ``request_id`` so a replay within TTL reuses ``reply``."""
+        self._seen[request_id] = (time.monotonic(), reply)
+        self._seen.move_to_end(request_id)
+        while len(self._seen) > self.capacity:
+            self._seen.popitem(last=False)
 
 
 async def send_only(socket_path: str, request: Request) -> None:
@@ -372,7 +416,11 @@ def _push_body(channel: str) -> dict[str, object]:
     return {"id": str(uuid.uuid4()), "note": f"test push on channel {channel}"}
 
 
-async def _serve_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+async def _serve_connection(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    replay_cache: ReplayCache,
+) -> None:
     """Handle one client connection: read requests, write replies, never reply to ``event``."""
     peer = writer.get_extra_info("peername")
     print(f"[serve] client connected: {peer}", file=sys.stderr)
@@ -392,10 +440,15 @@ async def _serve_connection(reader: asyncio.StreamReader, writer: asyncio.Stream
                 print(f"[serve] bad request: {exc}", file=sys.stderr)
                 continue
             print(f"[serve] op={request.op} id={request.id[:8]}", file=sys.stderr)
-            reply = handle_request(request)
-            if reply is None:
-                print("[serve] event: no reply (fire-and-forget)", file=sys.stderr)
-                continue
+            reply = replay_cache.get(request.id)
+            if reply is not None:
+                print(f"[serve] replay dedupe id={request.id[:8]}", file=sys.stderr)
+            else:
+                reply = handle_request(request)
+                if reply is None:
+                    print("[serve] event: no reply (fire-and-forget)", file=sys.stderr)
+                    continue
+                replay_cache.put(request.id, reply)
             writer.write(msgspec.json.encode(reply))
             writer.write(b"\n")
             await writer.drain()
@@ -451,11 +504,12 @@ async def run_serve(
     except FileNotFoundError:
         pass
     connections: set[asyncio.StreamWriter] = set()
+    replay_cache = ReplayCache()
 
     async def on_connect(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         connections.add(writer)
         try:
-            await _serve_connection(reader, writer)
+            await _serve_connection(reader, writer, replay_cache)
         finally:
             connections.discard(writer)
 

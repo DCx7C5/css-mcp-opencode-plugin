@@ -40,6 +40,15 @@ const DEBOUNCE_MS = 50
 const MAX_DEBOUNCE_BATCH = 20
 const SHORT_TIMEOUT_MS = 2_000
 
+/** Ops the Python server NEVER replies to (fire-and-forget; no orphan log). */
+const NO_REPLY_OPS = new Set(["event"])
+
+/** Consecutive failed reconnect cycles before the circuit breaker opens. */
+const CIRCUIT_BREAKER_LIMIT = 3
+
+/** Hard cap on in-flight requests awaiting a reply (bounds the pending map). */
+const MAX_PENDING = 256
+
 // ── logging ───────────────────────────────────────────────────────────
 
 const TAG = "[python-bridge]"
@@ -244,6 +253,14 @@ const HOOKABLE_EVENTS = new Set([
  * Routes responses by UUID so multiple in-flight requests can share a
  * single TCP connection.  Automatically reconnects with exponential
  * backoff when the Python server goes down.
+ *
+ * Liveness semantics (v0.4):
+ * - One deadline per rpc; rpcs survive reconnect until their own deadline.
+ * - Reply-expectation per op: NO_REPLY ops go through `send()` — they never
+ *   register a pending entry, so the server's non-reply cannot orphan them.
+ * - Circuit breaker: after N consecutive failed reconnect cycles all pending
+ *   are rejected once (batch) so blocking ops fail-closed fast instead of
+ *   hanging until every individual deadline.
  */
 class SocketPool {
     /** @type {string} */
@@ -262,6 +279,10 @@ class SocketPool {
     #reconnectDelay = RECONNECT_BASE_MS
     /** @type {(() => void) | null} — called after every successful connect */
     #onConnect = null
+    /** @type {number} — consecutive failed reconnect cycles */
+    #failStreak = 0
+    /** @type {boolean} — circuit breaker open: reject new + pending rpcs */
+    #breakerOpen = false
 
     /** @param {string} path — UNIX socket path */
     constructor(path) {
@@ -289,11 +310,18 @@ class SocketPool {
         this.#connecting = true
 
         const socket = net.createConnection(this.#path)
+        // Assign at creation, not just on connect: #onDisconnect's identity
+        // guard compares the failing socket against #socket, and a failed
+        // connect attempt (ENOENT etc.) must pass that guard too, or the
+        // reconnect chain dies (connecting stuck true, breaker never opens).
+        this.#socket = socket
 
         socket.on("connect", () => {
             this.#socket = socket
             this.#connecting = false
             this.#reconnectDelay = RECONNECT_BASE_MS
+            this.#failStreak = 0
+            this.#breakerOpen = false
             log.debug(`pool: connected (${this.#pending.size} pending)`)
             this.#onConnect?.()
         })
@@ -350,7 +378,10 @@ class SocketPool {
     }
 
     /**
-     * Handle disconnection — reject pending, schedule reconnect.
+     * Handle disconnection — schedule reconnect.  Pending rpcs are NOT
+     * rejected here: each keeps its own deadline and is re-sent after the
+     * reconnect (deadline retry).  Only the circuit breaker (N consecutive
+     * failed reconnect cycles) rejects all pending in one batch.
      * Idempotent: the socket identity guard prevents a single failure
      * (error + close double-fire) from tearing down a replacement socket.
      * @param {import("node:net").Socket} [sock]
@@ -361,14 +392,26 @@ class SocketPool {
         this.#connecting = false
         this.#buf = ""
 
-        // Reject all pending requests
+        this.#failStreak += 1
+        if (!this.#breakerOpen && this.#failStreak >= CIRCUIT_BREAKER_LIMIT) {
+            this.#breakerOpen = true
+            log.warn(
+                `pool: circuit breaker OPEN after ${this.#failStreak} failed reconnect cycles `
+                + `— rejecting ${this.#pending.size} pending rpcs`,
+            )
+            this.#rejectAllPending()
+        }
+
+        this.#scheduleReconnect()
+    }
+
+    /** Reject every pending rpc with null (fail-closed), clearing the map. */
+    #rejectAllPending() {
         for (const entry of this.#pending.values()) {
             clearTimeout(entry.timer)
             entry.resolve(null)
         }
         this.#pending.clear()
-
-        this.#scheduleReconnect()
     }
 
     /** Exponential backoff reconnect. */
@@ -383,7 +426,32 @@ class SocketPool {
     }
 
     /**
+     * Send one NDJSON request WITHOUT registering a pending entry.
+     * For NO_REPLY ops (reply-expectation per op): the server never replies,
+     * so a pending entry would just orphan/timeout. Best-effort write — if
+     * no socket is writable the line is dropped (these ops are informational).
+     * @param {string} op
+     * @param {object} body
+     */
+    send(op, body) {
+        this.#ensureConnected()
+        const id = randomUUID()
+        const line = JSON.stringify({ id, op, body }) + "\n"
+        if (this.#socket && !this.#socket.destroyed && this.#socket.writable) {
+            this.#socket.write(line)
+            log.debug(`pool: sent (no-reply) op=${op} id=${id.slice(0, 8)}`)
+            return
+        }
+        log.debug(`pool: send dropped op=${op} id=${id.slice(0, 8)} (no writable socket)`)
+    }
+
+    /**
      * Send one NDJSON request, wait for matching-id response.
+     *
+     * One deadline covers the whole lifetime, including any re-enqueue after
+     * a failed write; rpcs survive reconnect until that deadline. Returns
+     * null on timeout, disconnect-without-reconnect, breaker trip, or
+     * pending-map overflow.
      *
      * @param {string} op
      * @param {object} body
@@ -391,6 +459,14 @@ class SocketPool {
      * @returns {Promise<Record<string, any>|null>}
      */
     rpc(op, body, timeoutMs) {
+        if (this.#breakerOpen) {
+            log.warn(`pool: circuit breaker open — rejecting op=${op}`)
+            return Promise.resolve(null)
+        }
+        if (this.#pending.size >= MAX_PENDING) {
+            log.error(`pool: pending overflow (${MAX_PENDING}) — rejecting op=${op}`)
+            return Promise.resolve(null)
+        }
         this.#ensureConnected()
 
         const id = randomUUID()
@@ -419,29 +495,21 @@ class SocketPool {
                     return true
                 }
                 log.debug(`pool: socket unavailable for id=${id.slice(0, 8)}, retrying`)
-                this.#ensureConnected()
                 return false
             }
 
-            if (this.#socket && !this.#socket.destroyed && this.#socket.writable) {
-                doWrite()
-                return
-            }
+            if (doWrite()) return
 
-            // Not connected yet — poll until writable, connection fails, or
-            // the deadline fires. Cleared in every exit path.
+            // Not connected yet — poll until writable or the deadline fires.
+            // The deadline is the ONLY resolver here: rpcs survive reconnect
+            // (#onDisconnect does not reject them), so the poll just keeps
+            // waiting for a writable socket. Cleared in every exit path.
             poll = setInterval(() => {
                 if (this.#socket && !this.#socket.destroyed && this.#socket.writable) {
                     if (doWrite()) {
                         clearInterval(poll)
                         poll = null
                     }
-                } else if (!this.#connecting && !this.#socket) {
-                    clearInterval(poll)
-                    poll = null
-                    clearTimeout(timer)
-                    this.#pending.delete(id)
-                    resolve(null)
                 }
             }, 10)
         })
@@ -453,11 +521,7 @@ class SocketPool {
             clearTimeout(this.#reconnectTimer)
             this.#reconnectTimer = null
         }
-        for (const entry of this.#pending.values()) {
-            clearTimeout(entry.timer)
-            entry.resolve(null)
-        }
-        this.#pending.clear()
+        this.#rejectAllPending()
         if (this.#socket) {
             this.#socket.destroy()
             this.#socket = null
@@ -475,6 +539,12 @@ let _shortIdCounter = 0
 
 /**
  * High-level RPC wrapper — routes through the persistent pool.
+ *
+ * Reply-expectation per op: ops in NO_REPLY_OPS (e.g. `event`) are sent
+ * write-only via `pool.send()` — the server never replies, so registering a
+ * pending entry would only produce an orphan timeout log. All other ops
+ * register a pending entry and wait for the matching response.
+ *
  * @param {string} op
  * @param {object} body
  * @param {number} timeoutMs
@@ -485,8 +555,16 @@ function rpc(op, body, timeoutMs, { wait = true } = {}) {
     const shortId = String(++_shortIdCounter).padStart(8, "0")
     log.debug(`rpc[${shortId}] → op=${op} timeout=${timeoutMs}ms wait=${wait}`)
 
+    if (NO_REPLY_OPS.has(op)) {
+        // Server NEVER replies to this op — write-only, no pending entry,
+        // no orphan timeout log, no wait.
+        pool.send(op, body)
+        return Promise.resolve({})
+    }
+
     if (!wait) {
-        // Fire-and-forget: send, resolve immediately, don't wait for response.
+        // Reply expected but the caller doesn't need it: register with a
+        // short deadline so the reply can still be matched and resolved.
         pool.rpc(op, body, Math.min(timeoutMs, SHORT_TIMEOUT_MS)).catch(() => {})
         return Promise.resolve({})
     }

@@ -164,3 +164,29 @@ def test_push_body_generic_channel() -> None:
     client = _load_client()
     body = client._push_body("permissions.update")
     assert set(body) == {"id", "note"}
+
+
+def test_replay_cache_miss_then_hit() -> None:
+    client = _load_client()
+    cache = client.ReplayCache()
+    assert cache.get("req-1") is None
+    cache.put("req-1", {"id": "req-1", "ok": True})
+    assert cache.get("req-1") == {"id": "req-1", "ok": True}
+
+
+def test_replay_cache_ttl_expiry() -> None:
+    client = _load_client()
+    cache = client.ReplayCache(ttl=0.0)
+    cache.put("req-1", {"id": "req-1", "ok": True})
+    assert cache.get("req-1") is None
+
+
+def test_replay_cache_capacity_eviction() -> None:
+    client = _load_client()
+    cache = client.ReplayCache(capacity=2)
+    cache.put("a", {"id": "a", "ok": True})
+    cache.put("b", {"id": "b", "ok": True})
+    cache.put("c", {"id": "c", "ok": True})  # evicts "a" (LRU)
+    assert cache.get("a") is None
+    assert cache.get("b") == {"id": "b", "ok": True}
+    assert cache.get("c") == {"id": "c", "ok": True}
