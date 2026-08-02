@@ -126,6 +126,36 @@ client error (or no active client) replies `{ok:false, error:{code, message}}`.
 into the `promptAsync` body so the Python brain can steer the injected turn
 (target model/agent, custom system prompt, allowed tools).
 
+**Task launch (reverse-RPC):** Python can spawn a subagent at any time —
+the bridge replicates the opencode `task` tool over the SDK (the SDK exposes
+no `tool.execute`, but the task tool itself is just "create a child session +
+prompt it with the target agent"):
+
+```json
+{ "type": "push", "channel": "task.launch", "body": {
+  "id": "…", "prompt": "…",
+  "agent": "…", "model": { "providerID": "…", "modelID": "…" },
+  "system": "…", "tools": { "bash": true },
+  "title": "…", "parentSessionID": "…", "directory": "…",
+  "timeoutMs": 0
+} }
+```
+
+transport.js runs `client.session.create` (body `{parentID, title}`) then
+`client.session.prompt` (body `{parts:[text], agent, model, system, tools}`),
+which blocks until the run finishes, and replies:
+
+```json
+{ "id": "…", "ok": true, "sessionID": "…", "info": { "…": "…" }, "parts": [ "…" ], "text": "…" }
+```
+
+`text` is the last text part (mirrors the task tool's output extraction), so
+an MCP brain can expose a native `task_run`-style tool that wraps `task`.
+All knobs are optional except `prompt`; `timeoutMs` (default 0 = wait
+forever) replies `{ok:false, error:{code:"timeout", sessionID}}` and aborts
+the session best-effort via `client.session.abort`. First reply wins — a
+timeout reply is never followed by a late result reply.
+
 ---
 
 ## plugin-events.js — observer-only event forwarding
@@ -177,8 +207,9 @@ while sharing one transport. Behavior is identical to the per-file entries.
 Push channels consumed by transport.js: `capabilities.update` (live cap
 re-apply + config), `session.inject` (live content injection via
 `client.session.promptAsync`, FIFO/dedupe/fail-safe), `session.context.read`
-(reverse-RPC above). `permissions.update` is informational — permission rules
-live in the Python brain, there is nothing to cache JS-side.
+(reverse-RPC above), `task.launch` (reverse-RPC above). `permissions.update`
+is informational — permission rules live in the Python brain, there is
+nothing to cache JS-side.
 
 ## Testing
 
@@ -202,3 +233,6 @@ uv run --group test pytest   # scripts/client.py smoke tests
   fail-safe + A2A knob forwarding.
 - `tests/plugins.capabilities.test.mjs` — `capabilities.update` live
   enable/revoke of a hook capability.
+- `tests/plugins.task.test.mjs` — `task.launch` reverse-RPC: create + prompt
+  call shapes, result extraction, error / invalid / timeout / no-client
+  paths, malformed body ignored.

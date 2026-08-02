@@ -4,11 +4,11 @@
  * This module is the SINGLE shared instance for every plugin in this repo.
  * It owns the socket connection pool, the bootstrap handshake / capability
  * gate, the rpc() wrapper, the event debouncer, and the push consumers
- * (`capabilities.update`, `session.inject`, `session.context.read`). Per-concern
- * plugins in `plugins/` import from here and register only their own hooks.
- * Because ESM modules are singletons within one opencode process, all plugins
- * share one socket and one capability declaration no matter how many of them
- * are loaded.
+ * (`capabilities.update`, `session.inject`, `session.context.read`,
+ * `task.launch`). Per-concern plugins in `plugins/` import from here and
+ * register only their own hooks. Because ESM modules are singletons within
+ * one opencode process, all plugins share one socket and one capability
+ * declaration no matter how many of them are loaded.
  *
  * Lifecycle note (IDE → opencode → MCP/ACP server): the plugin loads before
  * the Python process that serves the socket exists. The pool reconnects with
@@ -404,6 +404,126 @@ async function readSessionContext(id, sessionID) {
 }
 
 /**
+ * Reverse-RPC: Python pushed `task.launch` and expects the subagent result
+ * back. Replicates the opencode `task` tool over the SDK client — the SDK
+ * exposes no `tool.execute`, but the task tool itself is just "create a
+ * child session + prompt it with the target agent": `session.create` then
+ * `session.prompt`, which blocks until the run finishes and returns
+ * `{info: AssistantMessage, parts: Part[]}`.
+ *
+ * Optional per-request knobs mirror the task tool's parameters and the
+ * `session.prompt` body: `agent`, `model {providerID, modelID}`, `system`,
+ * `tools {[key]: boolean}`, plus `title`, `parentSessionID` (child of the
+ * calling session), `directory` and `timeoutMs` (0 = wait forever; on expiry
+ * the run is aborted best-effort).
+ *
+ * Reply: `{id, ok:true, sessionID, info, parts, text}` — `text` is the last
+ * text part, mirroring the task tool's output extraction. Any client error
+ * is answered `{id, ok:false, error:{code, message, sessionID?}}`. The
+ * first reply wins; a timeout reply is never followed by a late result
+ * reply for the same id.
+ *
+ * @param {string} id Reply id echoed from the push body.
+ * @param {object} body
+ */
+async function launchTask(id, body) {
+    const client = activeClient
+    if (!client) {
+        log.error("task.launch: no active client (no plugin instance initialized the bridge)")
+        pool.reply(id, false, { error: { code: "no_client", message: "no plugin instance initialized the bridge" } })
+        return
+    }
+    const prompt = typeof body.prompt === "string" ? body.prompt.trim() : ""
+    if (!prompt) {
+        pool.reply(id, false, { error: { code: "invalid_request", message: "task.launch requires a non-empty prompt" } })
+        return
+    }
+    const agent = typeof body.agent === "string" && body.agent ? body.agent : undefined
+    const model = body.model && typeof body.model === "object" ? body.model : undefined
+    const system = typeof body.system === "string" ? body.system : undefined
+    const tools = body.tools && typeof body.tools === "object" ? body.tools : undefined
+    const title = typeof body.title === "string" ? body.title : undefined
+    const parentID = typeof body.parentSessionID === "string" ? body.parentSessionID : undefined
+    const directory = typeof body.directory === "string" ? body.directory : undefined
+    const timeoutMs = Number.isFinite(Number(body.timeoutMs)) && Number(body.timeoutMs) > 0 ? Number(body.timeoutMs) : 0
+
+    let sessionID
+    try {
+        const createRes = await client.session.create({
+            body: {
+                ...(parentID ? { parentID } : {}),
+                ...(title ? { title } : {}),
+            },
+            ...(directory ? { query: { directory } } : {}),
+        })
+        if (createRes?.error) {
+            log.error(`task.launch: create error: ${createRes.error.message ?? String(createRes.error)}`)
+            pool.reply(id, false, { error: { code: "client_error", message: createRes.error.message ?? String(createRes.error) } })
+            return
+        }
+        sessionID = createRes?.data?.id
+        if (!sessionID) {
+            pool.reply(id, false, { error: { code: "client_error", message: "session.create returned no id" } })
+            return
+        }
+    } catch (err) {
+        log.error(`task.launch: create exception: ${err.message}`)
+        pool.reply(id, false, { error: { code: "client_error", message: err.message } })
+        return
+    }
+
+    // Guard against a timeout reply being followed by a late result reply.
+    let replied = false
+    const reply = (ok, payload) => {
+        if (replied) return
+        replied = true
+        pool.reply(id, ok, payload)
+    }
+
+    log.debug(`task.launch: created session=${sessionID.slice(0, 8)} agent=${agent ?? "default"} timeoutMs=${timeoutMs}`)
+    let timer = null
+    if (timeoutMs > 0) {
+        timer = setTimeout(() => {
+            log.error(`task.launch: timeout session=${sessionID.slice(0, 8)} after ${timeoutMs}ms`)
+            reply(false, { error: { code: "timeout", message: `task.launch timed out after ${timeoutMs}ms`, sessionID } })
+            Promise.resolve(client.session.abort?.({ path: { id: sessionID } })).catch(() => {})
+        }, timeoutMs)
+    }
+
+    try {
+        const res = await client.session.prompt({
+            path: { id: sessionID },
+            body: {
+                parts: [{ type: "text", text: prompt }],
+                ...(agent ? { agent } : {}),
+                ...(model ? { model } : {}),
+                ...(system ? { system } : {}),
+                ...(tools ? { tools } : {}),
+            },
+        })
+        if (timer) clearTimeout(timer)
+        if (res?.error) {
+            log.error(`task.launch: prompt error session=${sessionID.slice(0, 8)}: ${res.error.message ?? String(res.error)}`)
+            reply(false, { error: { code: "client_error", message: res.error.message ?? String(res.error), sessionID } })
+            return
+        }
+        const parts = res?.parts
+        const text = Array.isArray(parts)
+            ? parts.findLast((p) => p?.type === "text")?.text ?? ""
+            : ""
+        log.debug(
+            `task.launch: completed session=${sessionID.slice(0, 8)}`
+            + ` parts=${Array.isArray(parts) ? parts.length : "?"}`,
+        )
+        reply(true, { sessionID, info: res?.info, parts, text })
+    } catch (err) {
+        if (timer) clearTimeout(timer)
+        log.error(`task.launch: exception session=${sessionID.slice(0, 8)}: ${err.message}`)
+        reply(false, { error: { code: "client_error", message: err.message, sessionID } })
+    }
+}
+
+/**
  * Handle a push from the Python server. Push dispatch runs BEFORE orphan
  * matching in the pool data handler.
  * @param {string} channel
@@ -426,6 +546,14 @@ function handlePush(channel, body) {
             void readSessionContext(body.id, body.sessionID)
         } else {
             log.error("session.context.read: missing id/sessionID, ignored")
+        }
+        return
+    }
+    if (channel === "task.launch" && body && typeof body === "object") {
+        if (typeof body.id === "string") {
+            void launchTask(body.id, body)
+        } else {
+            log.error("task.launch: missing id, ignored")
         }
         return
     }
