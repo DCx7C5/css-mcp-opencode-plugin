@@ -664,6 +664,54 @@ async function summarizeSession(id, sessionID, model) {
 }
 
 /**
+ * Answer a pending permission prompt programmatically (reverse-RPC, channel
+ * `permission.answer`). Pairs with the `permission.asked` event: Python sees
+ * a prompt (permissionID + sessionID in the event), decides to settle it
+ * without showing the human prompt, and pushes the answer back — opencode's
+ * own permission handler resolves the pending ask. `response` follows the
+ * SDK semantics: "once" / "always" / "reject".
+ */
+async function answerPermission(id, body) {
+    const response = body.response
+    if (response !== "once" && response !== "always" && response !== "reject") {
+        log.error(`permission.answer: invalid response=${response}, ignored`)
+        pool.reply(id, false, {
+            error: { code: "invalid_request", message: `response must be once|always|reject, got ${response}` },
+        })
+        return
+    }
+    const permissionID = typeof body.permissionID === "string" ? body.permissionID : ""
+    if (!permissionID) {
+        log.error("permission.answer: missing permissionID, ignored")
+        pool.reply(id, false, { error: { code: "invalid_request", message: "missing permissionID" } })
+        return
+    }
+    if (!activeClient?.postSessionIdPermissionsPermissionId) {
+        log.error("permission.answer: no active client (no plugin instance initialized the bridge)")
+        pool.reply(id, false, { error: { code: "no_client", message: "no plugin instance initialized the bridge" } })
+        return
+    }
+    const sessionID = typeof body.sessionID === "string" ? body.sessionID : ""
+    try {
+        const res = await activeClient.postSessionIdPermissionsPermissionId({
+            body: { response },
+            path: { id: sessionID, permissionID },
+            query: typeof body.directory === "string" && body.directory ? { directory: body.directory } : undefined,
+        })
+        if (res?.error) {
+            log.error(`permission.answer: client_error ${res.error.message ?? String(res.error)}`)
+            pool.reply(id, false, { error: { code: "client_error", message: res.error.message ?? String(res.error) } })
+            return
+        }
+        log.debug(`permission.answer: responded ${response} to permissionID=${permissionID.slice(0, 8)}`)
+        pool.reply(id, true, { permissionID, response })
+    } catch (err) {
+        log.error(`permission.answer: exception ${err.message}`)
+        pool.reply(id, false, { error: { code: "client_error", message: err.message } })
+    }
+}
+
+/**
  * Handle a push from the Python server. Push dispatch runs BEFORE orphan
  * matching in the pool data handler.
  * @param {string} channel
@@ -710,6 +758,14 @@ function handlePush(channel, body) {
             void summarizeSession(body.id, body.sessionID, body.model ?? null)
         } else {
             log.error("session.summarize: missing id/sessionID, ignored")
+        }
+        return
+    }
+    if (channel === "permission.answer" && body && typeof body === "object") {
+        if (typeof body.id === "string") {
+            void answerPermission(body.id, body)
+        } else {
+            log.error("permission.answer: missing id, ignored")
         }
         return
     }

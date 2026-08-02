@@ -9,6 +9,14 @@
  * Ownership: this hook returns immediately for every non-task tool; the
  * general tool gate in plugin-hooks.js handles those. Exactly one `pre`
  * RPC per tool invocation.
+ *
+ * Gate enrichment: before the `pre` RPC the plugin best-effort introspects
+ * the SDK for `available_agents` (`client.app.agents()` — validates the
+ * requested `agent` against what actually exists) and `tool_ids`
+ * (`client.tool.ids()` — confirms `task` is registered and what else is
+ * available; `client.tool.list()` needs a provider/model we cannot resolve
+ * here). Every introspection is time-bounded and fail-safe to `null`, so
+ * the gate never blocks on discovery.
  */
 
 import {
@@ -29,6 +37,35 @@ export const server = async ({ client, directory: dir, worktree: wt, project: pr
     startBridge({ client, directory: dir, worktree: wt, project: proj })
     const debug = debugEnabled()
     const log = (msg) => debug && console.debug("[python-bridge]", "[debug]", msg)
+
+    /** Time-bound a promise; resolve null on expiry or rejection. */
+    const bounded = (promise, ms) =>
+        Promise.race([promise, new Promise((resolve) => setTimeout(() => resolve(null), ms))])
+
+    /**
+     * Best-effort task-gate introspection. Both surfaces fail-safe to null;
+     * the gate RPC proceeds regardless.
+     * @returns {Promise<{available_agents: Array<object>|null, tool_ids: Array<string>|null}>}
+     */
+    async function taskIntel() {
+        const [agentsRes, toolIdsRes] = await Promise.allSettled([
+            bounded(client?.app?.agents?.() ?? Promise.resolve(null), 350),
+            bounded(client?.tool?.ids?.() ?? Promise.resolve(null), 350),
+        ])
+        const agents = agentsRes.status === "fulfilled" ? agentsRes.value : null
+        const toolIds = toolIdsRes.status === "fulfilled" ? toolIdsRes.value : null
+        const available_agents = agents?.data
+            ? agents.data.map((a) => ({
+                  name: a.name,
+                  description: a.description ?? "",
+                  mode: a.mode ?? "subagent",
+                  builtIn: a.builtIn ?? false,
+                  model: a.model ?? null,
+              }))
+            : null
+        const tool_ids = Array.isArray(toolIds?.data) ? toolIds.data : null
+        return { available_agents, tool_ids }
+    }
 
     return {
         "tool.execute.before": async (input, output) => {
@@ -90,6 +127,9 @@ export const server = async ({ client, directory: dir, worktree: wt, project: pr
                         agent: output.args?.agent ?? output.args?.subagent_type,
                         model: output.args?.model,
                     },
+                    // Best-effort introspection so the gate can validate the
+                    // requested agent/tool against what actually exists.
+                    ...(await taskIntel()),
                 },
                 timeouts.pre,
             ))

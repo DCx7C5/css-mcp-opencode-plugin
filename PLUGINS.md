@@ -75,6 +75,14 @@ opencode has no plugin API that launches subagents, so the `pre`-hook gate on
       "prompt": "...", "description": "...", "agent": "general", "model": "..." } } }
   ```
 
+- **Gate enrichment:** the `pre` body also carries best-effort introspection
+  so Python can validate the request against what actually exists:
+  `available_agents` (`client.app.agents()` — `{name, description, mode,
+  builtIn, model}` per agent) and `tool_ids` (`client.tool.ids()` — every
+  registered tool, confirming `task` is available). Both are time-bounded
+  (~350ms each, parallel) and fail-safe to `null` — the gate never blocks on
+  discovery (`client.tool.list()` needs a provider/model the gate cannot
+  resolve, so `ids()` stands in for schema checks).
 - Same fail-closed semantics as the general gate; supports `{args}` mutation
   and `{allow:false}` denial.
 
@@ -95,6 +103,22 @@ backwards-compat `{allow:bool}` from the minimal test brain. On a lost brain the
 hook **denies** (fail-closed) unless `OPENCODE_FAIL_OPEN=1`; with no brain ever
 connected it leaves the default ask flow. Python drives richer flows by pushing
 a `user`-kind part via `session.inject` (the human's answer resumes the chain).
+
+Every `permission.asked` event carries the permission **`id`** (plus
+`sessionID`, `callID`, `type`, `pattern`, `title`) so Python can correlate a
+pending prompt with a later programmatic settlement:
+
+```json
+{ "type": "push", "channel": "permission.answer", "body": {
+  "id": "…", "permissionID": "…", "sessionID": "…",
+  "response": "once" | "always" | "reject", "directory": "…" } }
+```
+
+transport.js calls `client.postSessionIdPermissionsPermissionId` (the same
+endpoint the popup buttons hit) and replies `{id, ok, permissionID, response}`.
+This lets Python auto-approve/deny prompts it already ruled on (e.g. from
+rules) without flashing a popup. `response` follows the SDK semantics;
+anything else replies `{ok:false, error:{code:"invalid_request"}}`.
 
 ---
 
@@ -247,9 +271,9 @@ Push channels consumed by transport.js: `capabilities.update` (live cap
 re-apply + config), `session.inject` (live content injection via
 `client.session.promptAsync`, FIFO/dedupe/fail-safe), `session.context.read`
 (reverse-RPC above), `task.launch` (reverse-RPC above), `session.intel` and
-`session.summarize` (reverse-RPCs above). `permissions.update` is
-informational — permission rules live in the Python brain, there is
-nothing to cache JS-side.
+`session.summarize` (reverse-RPCs above), `permission.answer` (reverse-RPC
+above). `permissions.update` is informational — permission rules live in the
+Python brain, there is nothing to cache JS-side.
 
 ## Testing
 
@@ -275,7 +299,15 @@ uv run --group test pytest   # scripts/client.py smoke tests
   enable/revoke of a hook capability.
 - `tests/plugins.task.test.mjs` — `task.launch` reverse-RPC: create + prompt
   call shapes, result extraction, error / invalid / timeout / no-client
-  paths, malformed body ignored.
+  paths, malformed body ignored; task-gate `pre` body enrichment
+  (`available_agents` / `tool_ids`, fail-safe introspection).
+- `tests/plugins.permission-answer.test.mjs` — `permission.answer`
+  reverse-RPC (once/always/reject, invalid response, missing permissionID,
+  client error, no-client) and the `permission.asked` event shipping the
+  permission `id`.
+- `tests/plugins.events.test.mjs` — event-forwarding completeness: every
+  SDK `Event` union type tracked, pipeline-capability fallback to
+  fire-and-forget, untracked ignored, zero pending RPCs left behind.
 - `tests/plugins.session.test.mjs` — `session.intel` reads (stats/recent/
   diff/todo, `what` filter, per-item fail-safe), `session.summarize`
   kick-off + model override, and the compaction-handshake `context` RPC body.

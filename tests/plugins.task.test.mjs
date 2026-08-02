@@ -20,6 +20,7 @@ const sock = join(dir, "hooks.sock")
 process.env.OPENCODE_PYTHON_SOCK = sock
 
 const replies = []
+const preOps = [] // captured `pre` RPC bodies (task gate)
 let brain
 let clientSocket = null
 let failPrompt = false
@@ -65,6 +66,24 @@ const makeClient = () => ({
             makeClient.calls.aborted.push(path.id)
         },
     },
+    app: {
+        agents: async () => ({
+            data: [
+                {
+                    name: "code-reviewer",
+                    description: "Reviews diffs",
+                    mode: "subagent",
+                    builtIn: false,
+                    model: { providerID: "anthropic", modelID: "opus" },
+                },
+                { name: "explore", description: "Finds files", mode: "subagent", builtIn: true },
+            ],
+            error: undefined,
+        }),
+    },
+    tool: {
+        ids: async () => ({ data: ["bash", "read", "task", "write"], error: undefined }),
+    },
 })
 makeClient.calls = { created: [], prompts: [], aborted: [] }
 
@@ -88,6 +107,9 @@ before(async () => {
                             capabilities: { pre: true, permission: true, context: true },
                         }) + "\n",
                     )
+                } else if (msg.op === "pre") {
+                    preOps.push(msg.body)
+                    socket.write(JSON.stringify({ id: msg.id, ok: true }) + "\n")
                 } else if (msg.id !== undefined && "ok" in msg) {
                     // Reverse-RPC reply written by transport.js.
                     replies.push(msg)
@@ -222,4 +244,56 @@ test("task.launch malformed body is ignored (no crash, no reply)", async () => {
     brainSend({ type: "push", channel: "task.launch", body: { prompt: "no id" } })
     await new Promise((r) => setTimeout(r, 300))
     assert.equal(replies.length, before)
+})
+
+test("task gate pre RPC ships available_agents + tool_ids enrichment", async () => {
+    // Restore the bridge client (secrets plugin nulled activeClient above).
+    await (await import("../plugins/plugin-hooks.js")).server({ client: makeClient() })
+    await new Promise((r) => setTimeout(r, 500))
+
+    preOps.length = 0
+    const gate = (await (await import("../plugins/plugin-task.js")).server({ client: makeClient() }))[
+        "tool.execute.before"
+    ]
+    const output = {
+        args: { prompt: "find the bug", agent: "code-reviewer", subagent_type: undefined },
+    }
+    await gate({ tool: "task", callID: "c-1", sessionID: "s-1" }, output)
+
+    const body = preOps[0]
+    assert.equal(body.tool, "task")
+    assert.deepEqual(body.task, {
+        prompt: "find the bug",
+        agent: "code-reviewer",
+    })
+    assert.deepEqual(body.available_agents, [
+        {
+            name: "code-reviewer",
+            description: "Reviews diffs",
+            mode: "subagent",
+            builtIn: false,
+            model: { providerID: "anthropic", modelID: "opus" },
+        },
+        { name: "explore", description: "Finds files", mode: "subagent", builtIn: true, model: null },
+    ])
+    assert.deepEqual(body.tool_ids, ["bash", "read", "task", "write"])
+    // Gate passed (brain replied ok:true, no throw).
+})
+
+test("task gate enrichment is fail-safe when SDK introspection throws", async () => {
+    preOps.length = 0
+    const brokenClient = {
+        app: { agents: async () => { throw new Error("agents boom") } },
+        tool: { ids: async () => ({ error: { message: "ids boom" } }) },
+    }
+    const gate = (await (await import("../plugins/plugin-task.js")).server({ client: brokenClient }))[
+        "tool.execute.before"
+    ]
+    const output = { args: { prompt: "do it", agent: "explore" } }
+    await gate({ tool: "task", callID: "c-2", sessionID: "s-2" }, output)
+
+    const body = preOps[0]
+    assert.equal(body.available_agents, null)
+    assert.equal(body.tool_ids, null)
+    assert.equal(body.task.agent, "explore")
 })

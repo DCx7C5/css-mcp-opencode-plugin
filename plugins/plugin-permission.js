@@ -47,6 +47,7 @@ export const server = async ({ client: c, directory: dir, worktree: wt, project:
             pushEvent({
                 type: "permission.asked",
                 properties: {
+                    id: input.id,
                     type: input.type,
                     pattern: input.pattern,
                     sessionID: input.sessionID,
