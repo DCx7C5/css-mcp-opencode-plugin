@@ -44,8 +44,12 @@ export const server = async ({ client, directory: dir, worktree: wt, project }) 
             // plugin-context.js's own event hook — not duplicated here.
             if (isHookableEvent(type)) {
                 if (!gateNonBlocking("eventPipeline")) {
-                    // Brain has no event.pipeline capability → skip pipeline.
-                    log(`event: brain has no eventPipeline capability, skipping ${type}`)
+                    // Brain has no event.pipeline capability → fall back to
+                    // the debounced fire-and-forget `event` RPC instead of
+                    // dropping the event — every tracked event reaches the
+                    // brain in every capability state.
+                    log(`event: brain has no eventPipeline capability, fire-and-forget ${type}`)
+                    pushEvent({ type, properties, directory: directory() ?? dir, worktree: worktree() ?? wt })
                     return
                 }
                 // Synchronous pipeline: pre-hooks → store → post-hooks.

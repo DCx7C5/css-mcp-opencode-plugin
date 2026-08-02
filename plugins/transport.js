@@ -724,6 +724,7 @@ const TRACKED_EVENTS = new Set([
     "command.executed",
     "file.edited",
     "file.watcher.updated",
+    "installation.update-available",
     "installation.updated",
     "lsp.client.diagnostics",
     "lsp.updated",
@@ -733,7 +734,13 @@ const TRACKED_EVENTS = new Set([
     "message.updated",
     "permission.asked",
     "permission.replied",
+    "permission.updated",
+    "pty.created",
+    "pty.deleted",
+    "pty.exited",
+    "pty.updated",
     "server.connected",
+    "server.instance.disposed",
     "session.created",
     "session.compacted",
     "session.deleted",
@@ -749,6 +756,7 @@ const TRACKED_EVENTS = new Set([
     "tui.prompt.append",
     "tui.command.execute",
     "tui.toast.show",
+    "vcs.branch.updated",
 ])
 
 /** True when the event type is one the bridge forwards to Python. */
@@ -1110,11 +1118,20 @@ class SocketPool {
         this.#connecting = false
         this.#buf = ""
     }
+
+    /** Test/introspection: current pool state. */
+    stats() {
+        return {
+            connected: Boolean(this.#socket && !this.#socket.destroyed && this.#socket.writable),
+            pending: this.#pending.size,
+            breakerOpen: this.#breakerOpen,
+            closed: this.#closed,
+        }
+    }
 }
 
 /** Process-wide pool instance. */
 const pool = new SocketPool(SOCKET_PATH)
-
 /** Monotonic counter for short log ids (replaces randomUUID().slice(0, 8)). */
 let _shortIdCounter = 0
 
@@ -1228,6 +1245,8 @@ const debouncer = new EventDebouncer()
 /** Queue a fire-and-forget event for debounced delivery to Python. */
 export const pushEvent = (event) => debouncer.push(event)
 
+/** Test/introspection helper: current pool state (pending rpc count etc.). */
+export const poolStats = () => pool.stats()
 /**
  * Shut the bridge down: close the socket pool (clears the reconnect chain,
  * rejects pending rpcs, destroys the socket) and cancel pending debounces so
