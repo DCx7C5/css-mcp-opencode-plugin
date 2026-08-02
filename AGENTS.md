@@ -4,7 +4,7 @@ Agent-facing guide. Read this first when working in this repo.
 
 ## What this is
 
-OpenCode ↔ Python bridge. The JS plugin (`socket-bridge.js`) is a thin transport between OpenCode and a Python "brain" over a Unix socket (NDJSON). The Python side owns all decisions: permission rules, task management, event classification, content injection. The JS side must be able to **block** OpenCode execution for every event type that can be blocked.
+OpenCode ↔ Python bridge. The JS plugins (`plugins/*.js` + shared `transport.js`) form a thin transport between OpenCode and a Python "brain" over a Unix socket (NDJSON). The Python side owns all decisions: permission rules, task management, event classification, content injection. The JS side must be able to **block** OpenCode execution for every event type that can be blocked.
 
 ## Goals
 
@@ -16,9 +16,11 @@ OpenCode ↔ Python bridge. The JS plugin (`socket-bridge.js`) is a thin transpo
 
 ## Architecture
 
-- `socket-bridge.js` (repo root, ESM): OpenCode plugin, named export `server = async ({client, directory, worktree, project}) => hooks` (the `PluginModule` shape `{id?, server, tui?}` from `@opencode-ai/plugin` — opencode resolves `module.server` for config/npm plugins; an arbitrary export name is never loaded). SocketPool = one shared Unix socket, UUID-multiplexed RPC, reconnect with backoff, event debouncing, push handling.
-- Python brain: **not part of this repo** (the `mcps/css-mcp` package was removed). The socket transport still expects an external server at `/var/run/css-mcp/hooks.sock`; without one the bridge runs **inert** (all hooks proceed — opencode is fully functional) until a brain connects. Test the transport with `scripts/client.py`.
-- Socket: `/var/run/css-mcp/hooks.sock` (`OPENCODE_PYTHON_SOCK` override), NDJSON `\n`-delimited, UTF-8.
+- `transport.js` (repo root, ESM): shared singleton — SocketPool (one shared Unix socket, UUID-multiplexed RPC, reconnect with backoff, circuit breaker), bootstrap handshake / capability gate, `rpc()`/`pushEvent()`, event debouncing, `session.inject` consumer. All plugins import from here; ESM singletons make the socket/capabilities shared no matter how many plugins load.
+- `plugins/*.js` (repo root `plugins/`, ESM): per-concern plugins, each a named `server = async ({client, directory, worktree, project}) => hooks`. `plugin-secrets.js` (.env hardblock, local always-on), `plugin-hooks.js` (general pre/post/shell-env), `plugin-task.js` (task/subagent gate), `plugin-permission.js` (permission authority = yes/no popups), `plugin-context.js` (compaction + context syncs), `plugin-events.js` (observer-only event forwarding). `plugins/index.js` re-exports all six — opencode's legacy loader treats each `server`-shaped export as a separate plugin, so one entry loads them all.
+- `plugins/index.js` (repo root `plugins/`, ESM): one-entry aggregator — npm/GitHub default (`package.json` `main`); opencode's legacy loader treats each `server`-shaped export as a separate plugin, so one entry loads all six.
+- Python brain: **not part of this repo** (the `mcps/css-mcp` package was removed). The socket transport still expects an external server at the resolved socket path; without one the bridge runs **inert** (all hooks proceed — opencode is fully functional) until a brain connects. Test the transport with `scripts/client.py`.
+- Socket: `$XDG_RUNTIME_DIR/css-mcp/hooks.sock` → `/tmp/css-mcp/hooks.sock` → legacy `/var/run/css-mcp/hooks.sock` only if it exists (`OPENCODE_PYTHON_SOCK` overrides all), NDJSON `\n`-delimited, UTF-8. The default moved to a user-writable path because an MCP/ACP child process (which may serve the socket) cannot create `/var/run/css-mcp` without root. Lifecycle: the plugin loads before the Python process exists; reconnect-with-backoff + re-bootstrap on every connect takes over authority live.
 - Two channels: **socket** (JS↔Py) and **MCP stdio** (OpenCode↔Py).
 
 ## Protocol (v0.4 draft — reference implementation: `scripts/client.py`)
@@ -78,13 +80,16 @@ Key semantics (do not regress):
 - [done] Phase 2 — JS FIX #1–#6 (reply-expectation via `NO_REPLY_OPS` + `pool.send()`, deadline retry — rpcs survive reconnect to their own deadline, server dedupe via `ReplayCache` LRU in client.py, `#onDisconnect` batch semantics via circuit breaker after 3 failed reconnect cycles, push-before-orphan, maxPending 256). E2E verified: NO_REPLY event leaves no pending entry, pre survives reconnect, pre fails closed fast (breaker) when brain gone; `socket-bridge.js` assigns `#socket` at create so failed connects still pass the disconnect guard.
 - [done] Phase 3 — JS shim features: `permission.ask` hook (permission authority, capability-gated, fail-closed deny on lost brain, `status: allow|ask|deny` reply with `{allow: bool}` back-compat), task-tool authority (pre-hook surfaces `task` subagent fields explicitly to the TaskManager gate), config deltas at bootstrap (`runtimeConfig` mutable object replaced wholesale per handshake/reconnect, also via `capabilities.update` push), `session.inject` consumer (`SessionInjector`: FIFO per session, dedupe by id, bounded window, `client.session.promptAsync` with synthetic text parts + `noReply: true`, fail-safe on client error / null client). E2E-verified: permission deny propagates, inject FIFO + dedupe + fail-safe.
 - [done] INERT-NO-BRAIN — loaded with no Python brain ever connecting now runs completely normal: blocking hooks proceed (pre allows, permission defaults to ask) instead of fail-closing; a one-time warn + per-gate debug note it. If a brain later connects it takes over authority live; if it was authority and is lost, blocking ops fail-closed again (`OPENCODE_FAIL_OPEN=1` opts out).
-- Note: the Python brain (socket server, permission module, TaskManager, MCP tools, A2A ingestion) is **out of repo scope** — implement it externally or as a separate project.
+- [done] MULTI-PLUGIN SPLIT — the monolithic bridge was divided into per-concern plugins sharing one `transport.js` singleton (SocketPool/bootstrap/caps/rpc/debouncer/injector). `plugins/` (no package.json → per-file entries resolve exactly): `plugin-secrets.js` (local always-on .env hardblock, runs before the Python gate), `plugin-hooks.js` (general pre/post/shell-env), `plugin-task.js` (subagent-launch gate), `plugin-permission.js` (permission authority = yes/no popups), `plugin-context.js` (compaction + context syncs), `plugin-events.js` (observer forwarding). `plugins/index.js` = one-entry aggregator and npm/GitHub default (`main`); the old combined `socket-bridge.js` was deleted as redundant. Default socket path moved to `$XDG_RUNTIME_DIR/css-mcp/hooks.sock` (user-writable — an MCP/ACP child process cannot create `/var/run/css-mcp`), legacy `/var/run` kept only if it exists.
+- Note: the Python brain (socket server, permission module, TaskManager, MCP tools, A2A ingestion) is **out of repo scope** — implement it externally or as a separate project. It may serve BOTH the MCP stdio channel and the Unix socket from one process (two asyncio tasks, shared in-memory state).
 
 ## Known decisions (do not reverse without discussion)
 
 - Option A: Python brain, JS blocking gate.
 - Blocking ops fail-closed only after a brain ever connected; never-connected → inert (all hooks proceed). `OPENCODE_FAIL_OPEN` explicit opt-in for the lost-brain case.
 - `permission.ask` hook is the permission authority (`client.permission.update()` does not exist).
+- Default socket path is user-writable (`$XDG_RUNTIME_DIR`/`/tmp`) so an MCP/ACP child process can serve it; `/var/run/css-mcp` is kept only if it already exists. `OPENCODE_PYTHON_SOCK` overrides all.
+- `.env` hardblock is a LOCAL always-on invariant (never Python-gated) — the one deliberate exception to "Python owns all decisions".
 - No plugin API launches subagents → pre-hook authority over `tool==="task"` (Python-side TaskManager tools are out of repo scope).
 - `config` hook mutates only at load → Python supplies config deltas at bootstrap; runtime `config.update` push channel dropped.
 - `session.inject` push channel added for live content injection / A2A (new in v0.4).
@@ -92,12 +97,13 @@ Key semantics (do not regress):
 
 ## Files
 
-- `socket-bridge.js` — the JS plugin (852-line baseline incl. bootstrap capability-gating)
-- `package.json` — npm-publishable plugin metadata (`main: socket-bridge.js`)
+- `transport.js` — shared singleton: SocketPool, bootstrap/capability gate, rpc, debouncer, session.inject consumer
+- `plugins/` — six per-concern plugins + `index.js` aggregator (no package.json here on purpose: per-file plugin entries resolve to the exact file; `index.js` is the npm/GitHub default)
+- `package.json` — npm-publishable plugin metadata (`main: plugins/index.js`)
 - `AGENTS.md` — this file
 - `README.md` — user-facing usage (npm / github URL / local symlink)
 - `pyproject.toml` — plain Python project (no workspace): `msgspec` dep for `scripts/client.py` + `test` dependency group (pytest/ruff)
-- `scripts/client.py` — NDJSON socket-bridge test client (v0.4 protocol) with `--serve` mode as the minimal test brain
+- `scripts/client.py` — NDJSON bridge test client (v0.4 protocol) with `--serve` mode as the minimal test brain
 - `.ai/mcp/mcp.json` — project-local MCP registration
 - `LICENSE` — MIT
 
@@ -105,7 +111,7 @@ Key semantics (do not regress):
 
 | var | default |
 |-----|---------|
-| OPENCODE_PYTHON_SOCK | /var/run/css-mcp/hooks.sock |
+| OPENCODE_PYTHON_SOCK | $XDG_RUNTIME_DIR/css-mcp/hooks.sock (or /tmp/css-mcp/hooks.sock) |
 | OPENCODE_BOOTSTRAP_TIMEOUT | 5000 |
 | OPENCODE_PRE_TIMEOUT | 5000 |
 | OPENCODE_PERMISSION_TIMEOUT | 5000 |
@@ -118,19 +124,26 @@ Key semantics (do not regress):
 ## Testing the plugin
 
 - The project opencode config lives in `.opencode/opencode.json` — not a root-level `opencode.json`.
-- The `plugin` entry for `socket-bridge.js` is **removed by default**: with no Python brain running the bridge would be inert (harmless), but the entry is left out of the default config so the repo ships load-clean without a socket.
-- To test the plugin, add the entry to `.opencode/opencode.json` and **restart opencode** (config is load-only, not hot-reloaded):
+- The config **ships with all six per-plugin entries active** (see below). With no Python brain running the bridge is inert (harmless) — but the `.env` hardblock (`plugin-secrets.js`) still applies locally, so decide consciously before keeping it enabled.
+- To test, point `.opencode/opencode.json` at the plugins and **restart opencode** (config is load-only, not hot-reloaded):
 
   ```json
   {
     "$schema": "https://opencode.ai/config.json",
-    "plugin": ["../socket-bridge.js"]
+    "plugin": [
+      "../plugins/plugin-secrets.js",
+      "../plugins/plugin-hooks.js",
+      "../plugins/plugin-task.js",
+      "../plugins/plugin-permission.js",
+      "../plugins/plugin-context.js",
+      "../plugins/plugin-events.js"
+    ]
   }
   ```
 
-  `../socket-bridge.js` is relative to `.opencode/` and resolves to the repo-root `socket-bridge.js`.
+  Paths are relative to `.opencode/`. `plugins/` has no `package.json`, so each entry resolves to the exact file (a repo-root package.json `main` would otherwise win). Secrets first → the local hardblock runs before the Python gate. `plugins/index.js` loads all six from one entry and is the npm/GitHub default.
 - Loading without a brain is now **safe and inert** — opencode runs normally; no `OPENCODE_FAIL_OPEN` needed. It only matters once a brain has connected and is lost (fail-closed default).
-- `scripts/client.py --serve` is the minimal test brain: it listens on the socket (default `/var/run/css-mcp/hooks.sock`, or `--socket`), replies to every op (never to `event`), and never denies `pre`/`permission`. Use `--push-channel <ch>` to broadcast a test push every `--push-interval` seconds (default 5). Ctrl-C exits with code 130 and removes the socket.
+- `scripts/client.py --serve` is the minimal test brain: it listens on the socket (default `$XDG_RUNTIME_DIR/css-mcp/hooks.sock` or `/tmp/css-mcp/hooks.sock`, or `--socket`), replies to every op (never to `event`), and never denies `pre`/`permission`. Use `--push-channel <ch>` to broadcast a test push every `--push-interval` seconds (default 5). Ctrl-C exits with code 130 and removes the socket.
 
 ## Tech stack / conventions
 
