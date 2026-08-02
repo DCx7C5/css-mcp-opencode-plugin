@@ -55,11 +55,25 @@ import uuid
 from collections import OrderedDict
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
 
 import msgspec
 
-DEFAULT_SOCKET = "/var/run/css-mcp/hooks.sock"
+
+def default_socket() -> str:
+    """User-writable socket default, mirroring transport.js resolution:
+    OPENCODE_PYTHON_SOCK → $XDG_RUNTIME_DIR/css-mcp/hooks.sock →
+    /tmp/css-mcp/hooks.sock. The Python side creates the socket, so it must
+    live in a directory an unprivileged MCP/ACP child process can write."""
+    override = os.environ.get("OPENCODE_PYTHON_SOCK")
+    if override:
+        return override
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime_dir:
+        return f"{runtime_dir}/css-mcp/hooks.sock"
+    return "/tmp/css-mcp/hooks.sock"
+
+
+DEFAULT_SOCKET = default_socket()
 
 DEFAULT_PUSH_INTERVAL = 5.0
 
@@ -176,7 +190,7 @@ async def send_only(socket_path: str, request: Request) -> None:
         await writer.wait_closed()
 
 
-async def exchange(socket_path: str, request: Request, timeout: float) -> tuple[Response | Any, Any] | None:
+async def exchange(socket_path: str, request: Request, timeout: float) -> tuple[Response, bytes]:
     """Send one request and await the matching reply.
 
     The server may push ``{"type": "push", ...}`` lines at any time; those are
@@ -213,11 +227,11 @@ async def exchange(socket_path: str, request: Request, timeout: float) -> tuple[
                 raise BridgeError("connection closed before a reply was received")
             raw = msgspec.json.decode(line, type=dict[str, object])
             if raw.get("type") == "push":
+                # Server push — forward to stdout, keep waiting for the reply.
                 sys.stdout.buffer.write(line)
                 sys.stdout.buffer.flush()
-                continue
-            response = msgspec.json.decode(line, type=Response)
-            return response, line
+            else:
+                return msgspec.json.decode(line, type=Response), line
     finally:
         writer.close()
         await writer.wait_closed()
@@ -364,14 +378,14 @@ def handle_request(request: Request) -> dict[str, object] | None:
     """Compute the test-brain reply for one request.
 
     Every op except ``event`` gets an ``ok: true`` reply with a payload the
-    plugin's hooks consume (see socket-bridge.js ``okReply`` contract):
+    plugin's hooks consume (see transport.js ``okReply`` contract):
 
     - ``pre``: ``allow: true`` (never denies)
     - ``permission``: ``status: "allow"`` (v0.4 protocol — never denies)
     - ``shell-env``: ``env: {}`` (nothing to inject)
     - ``event.pipeline``: ``hooks_ran: []`` (never blocks)
     - ``bootstrap``: a hook-``capabilities`` map (``pre``/``permission``/``post``/
-      ``shellEnv``/``context``/``eventPipeline`` — the keys socket-bridge.js
+      ``shellEnv``/``context``/``eventPipeline`` — the keys transport.js
       gates on)
     - ``config``, ``post``, ``context``: bare ``ok: true``
 

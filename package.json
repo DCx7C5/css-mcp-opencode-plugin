@@ -1,14 +1,15 @@
 {
   "name": "css-mcp-opencode-plugin",
-  "version": "0.1.0",
-  "description": "OpenCode ↔ Python bridge plugin: Python brain, JS blocking gate over a Unix socket",
+  "version": "0.2.0",
+  "description": "OpenCode ↔ Python bridge: multiple loadable plugins (secrets, hooks, task, permission, context, events) over a shared Unix socket",
   "type": "module",
-  "main": "socket-bridge.js",
+  "main": "plugins/index.js",
   "files": [
-    "socket-bridge.js"
+    "transport.js",
+    "plugins/"
   ],
   "scripts": {
-    "check": "node --check socket-bridge.js"
+    "check": "node --check transport.js && node --check plugins/plugin-hooks.js && node --check plugins/plugin-task.js && node --check plugins/plugin-permission.js && node --check plugins/plugin-context.js && node --check plugins/plugin-secrets.js && node --check plugins/plugin-events.js && node --check plugins/index.js"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "^1.18.10"

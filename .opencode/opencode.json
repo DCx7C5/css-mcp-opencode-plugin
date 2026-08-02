@@ -1,4 +1,11 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["github:DCx7C5/css-mcp-opencode-plugin"]
+  "plugin": [
+    "../plugins/plugin-secrets.js",
+    "../plugins/plugin-hooks.js",
+    "../plugins/plugin-task.js",
+    "../plugins/plugin-permission.js",
+    "../plugins/plugin-context.js",
+    "../plugins/plugin-events.js"
+  ]
 }

@@ -1,27 +1,54 @@
 /**
- * OpenCode ↔ Python bridge — raw NDJSON over Unix socket
- * Socket: /var/run/css-mcp/hooks.sock
+ * css-mcp shared transport — raw NDJSON over a Unix socket.
  *
- * Debug: set OPENCODE_BRIDGE_DEBUG=1 or OPENCODE_DEBUG=* in env.
- * Logs go to stderr (opencode captures it).
+ * This module is the SINGLE shared instance for every plugin in this repo.
+ * It owns the socket connection pool, the bootstrap handshake / capability
+ * gate, the rpc() wrapper, the event debouncer, and the push consumers
+ * (`capabilities.update`, `session.inject`). Per-concern plugins in `plugins/`
+ * import from here and register only their own hooks. Because ESM modules are
+ * singletons within one opencode process, all plugins share one socket and
+ * one capability declaration no matter how many of them are loaded.
  *
- * Architecture:
- *  - Persistent connection pool: one shared socket, reconnected on failure
- *  - Request/response multiplexing by UUID
- *  - Event debouncing for rapid fire-and-forget events
- *  - Blocking ops fail closed only AFTER a brain ever connected
- *    (OPENCODE_FAIL_OPEN === "1" to opt out). With no brain ever connected
- *    the bridge is inert: every hook proceeds normally, so loading the
- *    plugin without a Python server leaves opencode fully functional.
+ * Lifecycle note (IDE → opencode → MCP/ACP server): the plugin loads before
+ * the Python process that serves the socket exists. The pool reconnects with
+ * exponential backoff forever and re-runs the bootstrap handshake on every
+ * successful connect (`pool.onConnect = startBootstrap`), so when the Python
+ * process (which may be the MCP stdio server — see README) finally creates
+ * the socket, the bridge connects and takes over authority live. No restart.
+ *
+ * Socket path resolution (must be writable by the serving process, which
+ * runs as the user): OPENCODE_PYTHON_SOCK wins; else $XDG_RUNTIME_DIR/
+ * css-mcp/hooks.sock; else /tmp/css-mcp/hooks.sock; else the legacy
+ * /var/run/css-mcp/hooks.sock ONLY if it already exists (requires root to
+ * create — not usable by an MCP/ACP child process).
  */
 
 import net from "node:net"
 import { randomUUID } from "node:crypto"
+import { existsSync } from "node:fs"
 
 // ── config ────────────────────────────────────────────────────────────
 
-const SOCKET_PATH =
-    process.env.OPENCODE_PYTHON_SOCK || "/var/run/css-mcp/hooks.sock"
+const LEGACY_SOCKET = "/var/run/css-mcp/hooks.sock"
+
+const defaultSocketPath = () => {
+    const override = process.env.OPENCODE_PYTHON_SOCK
+    if (override) return override
+    const runtimeDir = process.env.XDG_RUNTIME_DIR
+    if (runtimeDir) return `${runtimeDir}/css-mcp/hooks.sock`
+    return "/tmp/css-mcp/hooks.sock"
+}
+
+const SOCKET_PATH = (() => {
+    const next = defaultSocketPath()
+    if (next.startsWith("/var/run/")) {
+        // Legacy path requires root to create; keep it only if it already
+        // exists (someone provisioned it) — otherwise fall back to the
+        // user-writable default so an MCP/ACP child process can serve it.
+        return existsSync(LEGACY_SOCKET) ? LEGACY_SOCKET : next
+    }
+    return next
+})()
 
 const parseTimeout = (env, fallback) => {
     const v = Number(env)
@@ -34,7 +61,8 @@ const PERMISSION_TIMEOUT_MS = parseTimeout(process.env.OPENCODE_PERMISSION_TIMEO
 const POST_TIMEOUT_MS = parseTimeout(process.env.OPENCODE_POST_TIMEOUT, 8_000)
 const CTX_TIMEOUT_MS = parseTimeout(process.env.OPENCODE_CTX_TIMEOUT, 3_000)
 const PIPELINE_TIMEOUT_MS = parseTimeout(process.env.OPENCODE_PIPELINE_TIMEOUT, 10_000)
-const FAIL_OPEN = process.env.OPENCODE_FAIL_OPEN === "1"
+/** Fail-open opt-out for the lost-brain case (blocking ops skip fail-closed). */
+export const FAIL_OPEN = process.env.OPENCODE_FAIL_OPEN === "1"
 const DEBUG = process.env.OPENCODE_BRIDGE_DEBUG === "1"
     || process.env.OPENCODE_DEBUG === "*"
 
@@ -73,13 +101,16 @@ const log = {
  */
 const okReply = (msg) => (msg && msg.ok === true ? msg : null)
 
+/** Public wrapper so plugins can validate server replies identically. */
+export { okReply }
+
 // ── bootstrap / capabilities ─────────────────────────────────────────
 
 /**
  * Hook capabilities the Python brain may register during the bootstrap
  * handshake. Each key maps to the hook that consults it:
  *
- *   pre            — tool.execute.before (blocking gate)
+ *   pre            — tool.execute.before (blocking gate, plugins/hooks + task)
  *   permission     — permission.ask (blocking authority)
  *   post           — tool.execute.after (non-blocking enrichment)
  *   shellEnv       — shell.env
@@ -148,6 +179,9 @@ let everReady = false
 /** One-time warn that the bridge is running inert (no brain ever connected). */
 let warnedInert = false
 
+/** Current config delta (read by the `config` hook in plugin-hooks.js). */
+
+
 /**
  * Run (or re-run) the bootstrap handshake. Re-applied on every reconnect:
  * the caps set is replaced wholesale by the newest reply, and all hooks read
@@ -191,7 +225,7 @@ function startBootstrap() {
  * @param {string} capKey
  * @returns {Promise<{kind: "rpc"} | {kind: "skip"} | {kind: "inert"} | {kind: "failed"}>}
  */
-async function gateBlocking(capKey) {
+export async function gateBlocking(capKey) {
     if (bootstrap.status === "pending") await awaitBootstrap()
     if (bootstrap.status === "ready" && bootstrap.caps.has(capKey)) return { kind: "rpc" }
     if (bootstrap.status === "ready") return { kind: "skip" }
@@ -204,14 +238,14 @@ async function gateBlocking(capKey) {
 
 /** Warn once when the bridge proceeds without any authority (no brain ever
  * connected). Used by blocking hooks on the inert path. */
-function warnInert() {
+export function warnInert() {
     if (warnedInert) return
     warnedInert = true
     log.warn("bridge inert: no Python brain ever connected — proceeding without authority")
 }
 
 /** Gate a *non-blocking* op: skip its RPC unless the capability is registered. */
-const gateNonBlocking = (capKey) => hasCap(capKey)
+export const gateNonBlocking = (capKey) => hasCap(capKey)
 
 // ── session.inject consumer ───────────────────────────────────────────
 
@@ -224,7 +258,9 @@ const gateNonBlocking = (capKey) => hasCap(capKey)
  *
  * `client.session.promptAsync` (POST /session/{id}/prompt_async) starts the
  * agent if needed and returns immediately — the right shape for injection
- * (we never block the push handler on a full model turn).
+ * (we never block the push handler on a full model turn). A `user`-kind
+ * injected part is how the human-in-the-chain flow works: Python pushes a
+ * question, opencode turns it into a prompt, the human answers.
  */
 class SessionInjector {
     /** @type {Map<string, Array<import("@opencode-ai/sdk").TextPartInput>>} */
@@ -380,6 +416,9 @@ const TRACKED_EVENTS = new Set([
     "tui.toast.show",
 ])
 
+/** True when the event type is one the bridge forwards to Python. */
+export const isTrackedEvent = (type) => TRACKED_EVENTS.has(type) || type.startsWith("session.")
+
 // Events that trigger a context sync to STATE.live_context.
 // The Python handler stores the result so it persists across compaction
 // cycles (the only path that actually injects into the LLM).
@@ -392,6 +431,9 @@ const CONTEXT_TRIGGER_EVENTS = new Set([
     "todo.updated",
     "lsp.client.diagnostics",
 ])
+
+/** True when the event type triggers a context sync. */
+export const isContextTriggerEvent = (type) => CONTEXT_TRIGGER_EVENTS.has(type)
 
 // Events that go through the synchronous hook pipeline (pre → store → post).
 // The JS bridge blocks OpenCode's event loop until the pipeline returns.
@@ -407,6 +449,9 @@ const HOOKABLE_EVENTS = new Set([
     "permission.asked",
     "permission.replied",
 ])
+
+/** True when the event type goes through the event.pipeline RPC. */
+export const isHookableEvent = (type) => HOOKABLE_EVENTS.has(type)
 
 // ── persistent connection pool ────────────────────────────────────────
 
@@ -714,7 +759,7 @@ let _shortIdCounter = 0
  * @param {{ wait?: boolean }} opts
  * @returns {Promise<Record<string, any>|null>}
  */
-function rpc(op, body, timeoutMs, { wait = true } = {}) {
+export function rpc(op, body, timeoutMs, { wait = true } = {}) {
     const shortId = String(++_shortIdCounter).padStart(8, "0")
     log.debug(`rpc[${shortId}] → op=${op} timeout=${timeoutMs}ms wait=${wait}`)
 
@@ -800,418 +845,84 @@ class EventDebouncer {
 
 const debouncer = new EventDebouncer()
 
+/** Queue a fire-and-forget event for debounced delivery to Python. */
+export const pushEvent = (event) => debouncer.push(event)
+
 /**
- * The opencode SDK client from the active plugin instance. Set in `server()`;
- * used by push consumers (`session.inject`) that fire from the pool data
- * handler, outside the hook closure.
+ * The opencode SDK client from the active plugin instance. Set by
+ * `startBridge()` in every plugin; used by push consumers (`session.inject`)
+ * that fire from the pool data handler, outside the hook closure.
  * @type {import("@opencode-ai/sdk").SdkClient}
  */
 let activeClient = null
 
-// ── plugin entry point ────────────────────────────────────────────────
-// Named export MUST be `server` (the PluginModule shape
-// `{ id?, server, tui? }` from @opencode-ai/plugin): opencode's loader
-// resolves `module.server` for config/npm plugins. An arbitrary name
-// (e.g. the old `PythonBridge`) is never read — the plugin would load
-// but no hooks would run.
+// ── plugin bootstrapping ──────────────────────────────────────────────
 
-export const server = async ({ client, directory, worktree, project }) => {
-    log.info(
-        `loading — socket=${SOCKET_PATH} failOpen=${FAIL_OPEN} debug=${DEBUG}`,
-    )
+/** Shared per-instance input context captured by the first startBridge call. */
+const bridgeEnv = {
+    /** @type {string|undefined} */
+    directory: undefined,
+    /** @type {string|undefined} */
+    worktree: undefined,
+    /** @type {{ name?: string, id?: string }|undefined} */
+    project: undefined,
+}
 
-    // Keep the client for push consumers (session.inject) that fire outside
-    // the hook closures, from the pool data handler.
-    activeClient = client ?? null
+/**
+ * Initialize the shared bridge from a plugin instance's input. Idempotent:
+ * the socket stat check runs once, `activeClient` is set to the newest
+ * instance, and the bootstrap handshake is kicked exactly once (the
+ * in-flight guard in startBootstrap prevents double-fire).
+ *
+ * @param {{ client?: import("@opencode-ai/sdk").SdkClient, directory?: string, worktree?: string, project?: { name?: string, id?: string } }} input
+ */
+export function startBridge(input) {
+    activeClient = input?.client ?? null
+    bridgeEnv.directory ??= input?.directory
+    bridgeEnv.worktree ??= input?.worktree
+    bridgeEnv.project ??= input?.project
 
-    // Validate socket path exists at startup (best-effort)
-    try {
-        const fs = await import("node:fs/promises")
-        const stat = await fs.stat(SOCKET_PATH)
-        if (!stat.isSocket()) {
-            log.warn(`${SOCKET_PATH} exists but is NOT a unix socket (type=${stat.mode})`)
-        } else {
-            log.debug(`socket path verified: ${SOCKET_PATH}`)
+    const statOnce = async () => {
+        try {
+            const fs = await import("node:fs/promises")
+            const stat = await fs.stat(SOCKET_PATH)
+            if (!stat.isSocket()) {
+                log.warn(`${SOCKET_PATH} exists but is NOT a unix socket (type=${stat.mode})`)
+            } else {
+                log.debug(`socket path verified: ${SOCKET_PATH}`)
+            }
+        } catch {
+            log.warn(`socket path not accessible: ${SOCKET_PATH}`)
+            log.warn("bridge loads inert: all hooks proceed normally until a Python brain connects")
         }
-    } catch (err) {
-        log.warn(`socket path not accessible: ${SOCKET_PATH} — ${err.code ?? err.message}`)
-        log.warn("bridge loads inert: all hooks proceed normally until a Python brain connects")
     }
+    void statOnce()
 
     // Kick off the bootstrap handshake immediately so the first hook call
     // already knows the brain's capabilities. Re-applied on every reconnect.
     pool.onConnect = startBootstrap
     startBootstrap()
-
-    try {
-        await client?.app?.log?.({
-            body: {
-                service: "python-bridge",
-                level: "info",
-                message: `bridge ready → unix:${SOCKET_PATH} (ndjson, pooled)`,
-                extra: { directory, worktree, debug: DEBUG },
-            },
-        })
-    } catch {
-        // app.log is best-effort
-    }
-
-    return {
-        // ── pre-hook ──────────────────────────────────────────────────
-        "tool.execute.before": async (input, output) => {
-            log.debug(`pre-hook: tool=${input.tool} callID=${input.callID}`)
-
-            debouncer.push({
-                type: "tool.execute.before",
-                properties: { tool: input.tool, callID: input.callID },
-                directory,
-                worktree,
-            })
-
-            const gate = await gateBlocking("pre")
-            if (gate.kind === "skip") {
-                // Brain is up but has no pre capability → proceed immediately.
-                log.debug(`pre-hook: brain has no pre capability, allowing tool=${input.tool}`)
-                return
-            }
-            if (gate.kind === "inert") {
-                // No brain ever connected → plugin is a no-op; proceed normally.
-                warnInert()
-                log.debug(`pre-hook: inert, allowing tool=${input.tool}`)
-                return
-            }
-            if (gate.kind === "failed") {
-                if (!FAIL_OPEN) {
-                    log.error(`pre-hook: BLOCKING tool=${input.tool} — python server unreachable (fail-closed)`)
-                    throw new Error(
-                        `Python pre-hook unreachable at ${SOCKET_PATH} — `
-                        + `tool "${input.tool}" blocked (fail-closed mode). `
-                        + `Set OPENCODE_FAIL_OPEN=1 to allow through.`,
-                    )
-                }
-                log.warn(`pre-hook: FAIL-OPEN tool=${input.tool} — python server unreachable, allowing through`)
-                return
-            }
-
-            const decision = okReply(await rpc(
-                "pre",
-                {
-                    tool: input.tool,
-                    sessionID: input.sessionID,
-                    callID: input.callID,
-                    args: output.args,
-                    directory,
-                    // Task-tool authority: surface the subagent request fields
-                    // explicitly so the Python TaskManager gate can decide
-                    // without re-parsing opaque args.
-                    task: input.tool === "task"
-                        ? {
-                            prompt: output.args?.prompt,
-                            description: output.args?.description,
-                            agent: output.args?.agent ?? output.args?.subagent_type,
-                            model: output.args?.model,
-                        }
-                        : undefined,
-                },
-                PRE_TIMEOUT_MS,
-            ))
-
-            if (!decision) {
-                if (!FAIL_OPEN) {
-                    log.error(`pre-hook: BLOCKING tool=${input.tool} — python server unreachable (fail-closed)`)
-                    throw new Error(
-                        `Python pre-hook unreachable at ${SOCKET_PATH} — `
-                        + `tool "${input.tool}" blocked (fail-closed mode). `
-                        + `Set OPENCODE_FAIL_OPEN=1 to allow through.`,
-                    )
-                }
-                log.warn(`pre-hook: FAIL-OPEN tool=${input.tool} — python server unreachable, allowing through`)
-                return
-            }
-
-            if (decision.args && typeof decision.args === "object") {
-                const keys = Object.keys(decision.args)
-                log.debug(`pre-hook: modifying args for tool=${input.tool}, keys=${keys.join(",")}`)
-                Object.assign(output.args, decision.args)
-            }
-            if (decision.allow === false) {
-                log.warn(`pre-hook: DENIED tool=${input.tool} reason="${decision.reason ?? "no reason"}"`)
-                throw new Error(decision.reason || "Blocked by Python pre-hook")
-            }
-            log.debug(`pre-hook: ALLOWED tool=${input.tool}`)
-        },
-
-        // ── permission authority ──────────────────────────────────────
-        // `permission.ask` is a blocking authority: the Python brain decides
-        // allow / ask / deny for every permission prompt. Task-tool authority
-        // is handled by the pre-hook above (tool==="task" flows through the
-        // same gate with its full args) — no plugin API launches subagents,
-        // so Python's TaskManager rules live behind that gate.
-        "permission.ask": async (input, output) => {
-            log.debug(`permission.ask: type=${input.type} title="${input.title?.slice(0, 60)}"`)
-
-            debouncer.push({
-                type: "permission.asked",
-                properties: {
-                    type: input.type,
-                    pattern: input.pattern,
-                    sessionID: input.sessionID,
-                    callID: input.callID,
-                    title: input.title,
-                },
-                directory,
-                worktree,
-            })
-
-            const gate = await gateBlocking("permission")
-            if (gate.kind === "skip") {
-                // Brain is up but has no permission capability → proceed with
-                // the default ask flow (deterministic fast path).
-                log.debug("permission.ask: brain has no permission capability, default ask")
-                return
-            }
-            if (gate.kind === "inert") {
-                // No brain ever connected → plugin is a no-op; default ask.
-                warnInert()
-                log.debug("permission.ask: inert, default ask")
-                return
-            }
-            if (gate.kind === "failed") {
-                if (!FAIL_OPEN) {
-                    log.error("permission.ask: DENYING — python server unreachable (fail-closed)")
-                    output.status = "deny"
-                    return
-                }
-                log.warn("permission.ask: FAIL-OPEN — python server unreachable, default ask")
-                return
-            }
-
-            const decision = okReply(await rpc(
-                "permission",
-                {
-                    id: input.id,
-                    type: input.type,
-                    pattern: input.pattern,
-                    sessionID: input.sessionID,
-                    messageID: input.messageID,
-                    callID: input.callID,
-                    title: input.title,
-                    metadata: input.metadata,
-                    directory,
-                },
-                PERMISSION_TIMEOUT_MS,
-            ))
-
-            if (!decision) {
-                if (!FAIL_OPEN) {
-                    log.error("permission.ask: DENYING — python server unreachable (fail-closed)")
-                    output.status = "deny"
-                    return
-                }
-                log.warn("permission.ask: FAIL-OPEN — no reply, default ask")
-                return
-            }
-
-            // Brain reply: {status: "allow"|"ask"|"deny"} (v0.4), with
-            // backwards-compat {allow: bool} from the minimal test brain.
-            const status = decision.status
-                ?? (decision.allow === false ? "deny" : decision.allow === true ? "allow" : "ask")
-            if (status === "allow" || status === "ask" || status === "deny") {
-                log.debug(`permission.ask: brain says ${status} (${input.type})`)
-                output.status = status
-            } else {
-                log.warn(`permission.ask: unknown status=${status}, default ask`)
-            }
-        },
-
-        // ── post-hook ─────────────────────────────────────────────────
-        "tool.execute.after": async (input, output) => {
-            log.debug(`post-hook: tool=${input.tool} callID=${input.callID}`)
-
-            debouncer.push({
-                type: "tool.execute.after",
-                properties: { tool: input.tool, callID: input.callID },
-                directory,
-                worktree,
-            })
-
-            if (!gateNonBlocking("post")) {
-                // Brain has no post capability → leave output unchanged.
-                log.debug(`post-hook: brain has no post capability, leaving output unchanged`)
-                return
-            }
-
-            const decision = okReply(await rpc(
-                "post",
-                {
-                    tool: input.tool,
-                    sessionID: input.sessionID,
-                    callID: input.callID,
-                    args: input.args,
-                    title: output.title,
-                    output: output.output,
-                    metadata: output.metadata,
-                    directory,
-                },
-                POST_TIMEOUT_MS,
-            ))
-
-            if (!decision) {
-                log.debug(`post-hook: no response for tool=${input.tool}, leaving output unchanged`)
-                return
-            }
-
-            if (decision.title !== undefined) {
-                log.debug(`post-hook: replacing title for tool=${input.tool}`)
-                output.title = decision.title
-            }
-            if (decision.output !== undefined) {
-                log.debug(`post-hook: replacing output for tool=${input.tool} (${String(decision.output).length} chars)`)
-                output.output = decision.output
-            }
-            if (decision.metadata && typeof decision.metadata === "object") {
-                const keys = Object.keys(decision.metadata)
-                log.debug(`post-hook: merging metadata for tool=${input.tool}, keys=${keys.join(",")}`)
-                output.metadata = { ...(output.metadata || {}), ...decision.metadata }
-            }
-        },
-
-        // ── shell env injection ───────────────────────────────────────
-        "shell.env": async (input, output) => {
-            log.debug(`shell-env: cwd=${input.cwd}`)
-
-            debouncer.push({
-                type: "shell.env",
-                properties: { cwd: input.cwd },
-                directory,
-                worktree,
-            })
-
-            if (!gateNonBlocking("shellEnv")) {
-                // Brain has no shell-env capability → env unchanged.
-                log.debug("shell-env: brain has no shellEnv capability, env unchanged")
-                return
-            }
-
-            const reply = okReply(await rpc(
-                "shell-env",
-                {
-                    cwd: input.cwd,
-                    sessionID: input.sessionID,
-                    callID: input.callID,
-                    directory,
-                },
-                SHORT_TIMEOUT_MS,
-            ))
-
-            if (!reply) {
-                log.debug("shell-env: no response, env unchanged")
-                return
-            }
-
-            if (reply.env && typeof reply.env === "object") {
-                const keys = Object.keys(reply.env)
-                log.debug(`shell-env: injecting ${keys.length} env vars: ${keys.join(",")}`)
-                Object.assign(output.env, reply.env)
-            }
-        },
-
-        // ── session compaction context ────────────────────────────────
-        "experimental.session.compacting": async (input, output) => {
-            log.debug(`compacting: sessionID=${input?.sessionID}`)
-
-            if (!gateNonBlocking("context")) {
-                // Brain has no context capability → context unchanged.
-                log.debug("compacting: brain has no context capability, context unchanged")
-                return
-            }
-
-            const reply = okReply(await rpc(
-                "context",
-                {
-                    reason: "compacting",
-                    sessionID: input?.sessionID,
-                    directory,
-                    worktree,
-                    project: project?.name || project?.id,
-                },
-                CTX_TIMEOUT_MS,
-            ))
-
-            if (!reply) {
-                log.debug("compacting: no response, context unchanged")
-                return
-            }
-
-            if (reply.prompt && typeof reply.prompt === "string") {
-                log.debug(`compacting: injecting prompt (${reply.prompt.length} chars)`)
-                output.prompt = reply.prompt
-                return
-            }
-
-            const ctx = reply.context
-            if (!ctx) {
-                log.debug("compacting: empty context in reply")
-                return
-            }
-
-            if (Array.isArray(ctx)) {
-                log.debug(`compacting: injecting ${ctx.length} context items`)
-                output.context.push(...ctx)
-            } else if (typeof ctx === "string") {
-                log.debug(`compacting: injecting context string (${ctx.length} chars)`)
-                output.context.push(ctx)
-            }
-        },
-
-        // ── event forwarding ──────────────────────────────────────────
-        event: async ({ event }) => {
-            const type = event.type
-            if (!TRACKED_EVENTS.has(type) && !type.startsWith("session.")) return
-
-            const properties = event.properties ?? event.data ?? {}
-            log.debug(`event: type=${type} keys=${Object.keys(properties).join(",") || "none"}`)
-
-            if (HOOKABLE_EVENTS.has(type)) {
-                if (!gateNonBlocking("eventPipeline")) {
-                    // Brain has no event.pipeline capability → skip pipeline.
-                    log.debug(`event: brain has no eventPipeline capability, skipping ${type}`)
-                    return
-                }
-                // Synchronous pipeline: pre-hooks → store → post-hooks.
-                // The host never awaits event hooks (H3 spike verdict), so
-                // this RPC runs to its own deadline without blocking
-                // OpenCode's event loop; results are informational only.
-                const result = okReply(await rpc(
-                    "event.pipeline",
-                    { type, properties, directory, worktree },
-                    PIPELINE_TIMEOUT_MS,
-                ))
-
-                if (result?.blocked) {
-                    log.info(`event: BLOCKED by pre-hook: ${type}`)
-                    return
-                }
-
-                log.debug(`event: pipeline ok, hooks_ran=${(result?.hooks_ran ?? []).join(",") || "none"}`)
-            } else {
-                // Non-hookable events: debounced fire-and-forget.
-                debouncer.push({ type, properties, directory, worktree })
-            }
-
-            // Context-trigger events sync relevant context into
-            // STATE.live_context server-side.
-            if (CONTEXT_TRIGGER_EVENTS.has(type) && gateNonBlocking("context")) {
-                log.debug(`event: syncing context for ${type}`)
-                rpc(
-                    "context",
-                    { reason: type, properties, directory, worktree },
-                    CTX_TIMEOUT_MS,
-                    { wait: false },
-                ).catch((err) => {
-                    log.debug(`event: context sync failed for ${type}: ${err.message}`)
-                })
-            }
-        },
-    }
 }
+
+/** The directory of the plugin instance that initialized the bridge. */
+export const directory = () => bridgeEnv.directory
+
+/** The git worktree root of the plugin instance (undefined if not a repo). */
+export const worktree = () => bridgeEnv.worktree
+
+/** The project metadata of the plugin instance. */
+export const project = () => bridgeEnv.project
+
+/** Timeout presets shared by the hooks. */
+export const timeouts = {
+    bootstrap: BOOTSTRAP_TIMEOUT_MS,
+    pre: PRE_TIMEOUT_MS,
+    permission: PERMISSION_TIMEOUT_MS,
+    post: POST_TIMEOUT_MS,
+    context: CTX_TIMEOUT_MS,
+    pipeline: PIPELINE_TIMEOUT_MS,
+    short: SHORT_TIMEOUT_MS,
+}
+
+/** Debug flag (used by hooks for cheap log branching). */
+export const debugEnabled = () => DEBUG
