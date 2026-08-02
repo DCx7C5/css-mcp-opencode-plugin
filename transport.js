@@ -357,6 +357,49 @@ class SessionInjector {
 const injector = new SessionInjector()
 
 /**
+ * Reverse-RPC: Python pushed `session.context.read` and expects the current
+ * session context back. Fetch the session + messages from the SDK client and
+ * reply over the socket (`pool.reply`). Fail-safe: any client error is
+ * answered with an error reply, never thrown into the push handler.
+ *
+ * The SDK returns `{data, error, request, response}` (responseStyle
+ * "fields"), so both the result error field and thrown exceptions are
+ * handled.
+ *
+ * @param {string} id Reply id echoed from the push body.
+ * @param {string} sessionID Session to read.
+ */
+async function readSessionContext(id, sessionID) {
+    const client = activeClient
+    if (!client) {
+        log.error("session.context.read: no active client (no plugin instance initialized the bridge)")
+        pool.reply(id, false, { error: { code: "no_client", message: "no plugin instance initialized the bridge" } })
+        return
+    }
+    try {
+        const [sessionRes, messagesRes] = await Promise.all([
+            client.session.get({ path: { id: sessionID } }),
+            client.session.messages({ path: { id: sessionID } }),
+        ])
+        const err = sessionRes?.error ?? messagesRes?.error
+        if (err) {
+            log.error(`session.context.read: client error session=${sessionID.slice(0, 8)}: ${err.message ?? String(err)}`)
+            pool.reply(id, false, { error: { code: "client_error", message: err.message ?? String(err) } })
+            return
+        }
+        const messages = messagesRes?.data
+        log.debug(
+            `session.context.read: replied session=${sessionID.slice(0, 8)}`
+            + ` messages=${Array.isArray(messages) ? messages.length : "?"}`,
+        )
+        pool.reply(id, true, { session: sessionRes?.data, messages })
+    } catch (err) {
+        log.error(`session.context.read: exception session=${sessionID.slice(0, 8)}: ${err.message}`)
+        pool.reply(id, false, { error: { code: "client_error", message: err.message } })
+    }
+}
+
+/**
  * Handle a push from the Python server. Push dispatch runs BEFORE orphan
  * matching in the pool data handler.
  * @param {string} channel
@@ -376,6 +419,14 @@ function handlePush(channel, body) {
     }
     if (channel === "session.inject" && body && typeof body === "object") {
         injector.push(body, activeClient)
+        return
+    }
+    if (channel === "session.context.read" && body && typeof body === "object") {
+        if (typeof body.id === "string" && typeof body.sessionID === "string") {
+            void readSessionContext(body.id, body.sessionID)
+        } else {
+            log.error("session.context.read: missing id/sessionID, ignored")
+        }
         return
     }
     // permissions.update is informational on the JS side: permission rules
@@ -491,6 +542,8 @@ class SocketPool {
     #failStreak = 0
     /** @type {boolean} — circuit breaker open: reject new + pending rpcs */
     #breakerOpen = false
+    /** @type {boolean} — closed: no new connects, no reconnect (unload/tests) */
+    #closed = false
 
     /** @param {string} path — UNIX socket path */
     constructor(path) {
@@ -508,6 +561,7 @@ class SocketPool {
 
     /** Ensure we have a live connection.  No-op if already connected or connecting. */
     #ensureConnected() {
+        if (this.#closed) return
         if (this.#socket && !this.#socket.destroyed && this.#socket.writable) return
         if (this.#connecting) return
         if (this.#socket) {
@@ -595,6 +649,7 @@ class SocketPool {
      * @param {import("node:net").Socket} [sock]
      */
     #onDisconnect(sock) {
+        if (this.#closed) return
         if (sock && this.#socket !== sock) return
         this.#socket = null
         this.#connecting = false
@@ -642,6 +697,10 @@ class SocketPool {
      * @param {object} body
      */
     send(op, body) {
+        if (this.#closed) {
+            log.debug(`pool: send dropped op=${op} (bridge closed)`)
+            return
+        }
         this.#ensureConnected()
         const id = randomUUID()
         const line = JSON.stringify({ id, op, body }) + "\n"
@@ -651,6 +710,31 @@ class SocketPool {
             return
         }
         log.debug(`pool: send dropped op=${op} id=${id.slice(0, 8)} (no writable socket)`)
+    }
+
+    /**
+     * Write a response line for a reverse-RPC push: Python sent a push
+     * carrying an `id` (e.g. `session.context.read`), JS computes the data
+     * and answers with the standard `{id, ok, ...}` response shape so the
+     * Python side's pending map matches it like any request reply.
+     * Best-effort: if no socket is writable the reply is dropped.
+     *
+     * @param {string} id
+     * @param {boolean} ok
+     * @param {Record<string, any>} payload Extra fields merged into the line.
+     */
+    reply(id, ok, payload = {}) {
+        if (this.#closed) {
+            log.debug(`pool: reply dropped id=${id.slice(0, 8)} ok=${ok} (bridge closed)`)
+            return
+        }
+        const line = JSON.stringify({ id, ok, ...payload }) + "\n"
+        if (this.#socket && !this.#socket.destroyed && this.#socket.writable) {
+            this.#socket.write(line)
+            log.debug(`pool: replied id=${id.slice(0, 8)} ok=${ok}`)
+            return
+        }
+        log.debug(`pool: reply dropped id=${id.slice(0, 8)} ok=${ok} (no writable socket)`)
     }
 
     /**
@@ -667,6 +751,10 @@ class SocketPool {
      * @returns {Promise<Record<string, any>|null>}
      */
     rpc(op, body, timeoutMs) {
+        if (this.#closed) {
+            log.debug(`pool: rpc rejected op=${op} (bridge closed)`)
+            return Promise.resolve(null)
+        }
         if (this.#breakerOpen) {
             log.warn(`pool: circuit breaker open — rejecting op=${op}`)
             return Promise.resolve(null)
@@ -725,6 +813,7 @@ class SocketPool {
 
     /** Shutdown the pool gracefully. */
     close() {
+        this.#closed = true
         if (this.#reconnectTimer !== null) {
             clearTimeout(this.#reconnectTimer)
             this.#reconnectTimer = null
@@ -841,12 +930,29 @@ class EventDebouncer {
             void rpc("event", { type: "event.batch", events: batch }, SHORT_TIMEOUT_MS, { wait: false })
         }
     }
+
+    /** Cancel every pending debounce timer (bridge shutdown). */
+    clear() {
+        for (const timer of this.#timers.values()) clearTimeout(timer)
+        this.#timers.clear()
+        this.#batches.clear()
+    }
 }
 
 const debouncer = new EventDebouncer()
 
 /** Queue a fire-and-forget event for debounced delivery to Python. */
 export const pushEvent = (event) => debouncer.push(event)
+
+/**
+ * Shut the bridge down: close the socket pool (clears the reconnect chain,
+ * rejects pending rpcs, destroys the socket) and cancel pending debounces so
+ * the event loop drains. Used by tests and available for plugin unload.
+ */
+export const closeBridge = () => {
+    debouncer.clear()
+    pool.close()
+}
 
 /**
  * The opencode SDK client from the active plugin instance. Set by

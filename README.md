@@ -28,6 +28,9 @@ Unix socket; all decision logic lives in a Python "brain".
   classification, and content injection. Test the transport with
   [`scripts/client.py`](scripts/client.py).
 
+> **Per-plugin feature reference:** every hook, capability, and reply contract
+> is documented in [`PLUGINS.md`](PLUGINS.md).
+
 ## Lifecycle: IDE → opencode → MCP/ACP server
 
 The plugin loads at opencode startup, **before** the Python process that serves
@@ -117,6 +120,40 @@ Python gate. To load all of them from a single entry instead, point at
 `plugins/index.js` (opencode loads every `server`-shaped export as a separate
 plugin) — this is also the npm/GitHub default.
 
+### opencode.json entries — every load form
+
+Plugins are declared in the `"plugin"` array. Put it in the **project**
+`.opencode/opencode.json`, or in the **global** `~/.config/opencode/opencode.json`
+to apply to every project.
+
+| form | entry | loads |
+|------|-------|-------|
+| npm package | `"plugin": ["css-mcp-opencode-plugin"]` | all six via `main` (`plugins/index.js`) |
+| GitHub URL | `"plugin": ["github:DCx7C5/css-mcp-opencode-plugin"]` | all six via `main` |
+| local per-file | `"plugin": ["../plugins/plugin-secrets.js", …]` | exactly the listed plugins (project-local dev) |
+| local aggregator | `"plugin": ["../plugins/index.js"]` | all six, one entry |
+| single plugin | `"plugin": ["../plugins/plugin-secrets.js"]` | one plugin only |
+
+Example — project `.opencode/opencode.json`, all six from this repo:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    "../plugins/plugin-secrets.js",
+    "../plugins/plugin-hooks.js",
+    "../plugins/plugin-task.js",
+    "../plugins/plugin-permission.js",
+    "../plugins/plugin-context.js",
+    "../plugins/plugin-events.js"
+  ]
+}
+```
+
+Config is read once at startup — **restart opencode** after changing it (no
+hot-reload). Per-file entries resolve to the exact file because `plugins/` has
+no `package.json`; the repo-root `main` would otherwise win.
+
 ## Environment variables
 
 | var | default |
@@ -159,13 +196,16 @@ The `bootstrap` reply carries the hook capability map the JS side gates on:
 A live `capabilities.update` push re-applies the map without a reconnect.
 `session.inject` pushes deliver live content into an active session — a
 `user`-kind part is how Python asks the human a question mid-session
-(human-in-the-chain).
+(human-in-the-chain). `session.context.read` is a reverse-RPC: Python pushes
+`{id, sessionID}` and transport.js replies with the session + messages (see
+[`PLUGINS.md`](PLUGINS.md)).
 
 ## Testing the transport
 
 ```bash
 uv run --group test pytest
 npm run check            # node --check every JS file
+npm test                 # node --test — plugin unit (inert) + E2E suites
 scripts/client.py --serve   # minimal test brain on the socket
 ```
 

@@ -81,6 +81,7 @@ Key semantics (do not regress):
 - [done] Phase 3 — JS shim features: `permission.ask` hook (permission authority, capability-gated, fail-closed deny on lost brain, `status: allow|ask|deny` reply with `{allow: bool}` back-compat), task-tool authority (pre-hook surfaces `task` subagent fields explicitly to the TaskManager gate), config deltas at bootstrap (`runtimeConfig` mutable object replaced wholesale per handshake/reconnect, also via `capabilities.update` push), `session.inject` consumer (`SessionInjector`: FIFO per session, dedupe by id, bounded window, `client.session.promptAsync` with synthetic text parts + `noReply: true`, fail-safe on client error / null client). E2E-verified: permission deny propagates, inject FIFO + dedupe + fail-safe.
 - [done] INERT-NO-BRAIN — loaded with no Python brain ever connecting now runs completely normal: blocking hooks proceed (pre allows, permission defaults to ask) instead of fail-closing; a one-time warn + per-gate debug note it. If a brain later connects it takes over authority live; if it was authority and is lost, blocking ops fail-closed again (`OPENCODE_FAIL_OPEN=1` opts out).
 - [done] MULTI-PLUGIN SPLIT — the monolithic bridge was divided into per-concern plugins sharing one `transport.js` singleton (SocketPool/bootstrap/caps/rpc/debouncer/injector). `plugins/` (no package.json → per-file entries resolve exactly): `plugin-secrets.js` (local always-on .env hardblock, runs before the Python gate), `plugin-hooks.js` (general pre/post/shell-env), `plugin-task.js` (subagent-launch gate), `plugin-permission.js` (permission authority = yes/no popups), `plugin-context.js` (compaction + context syncs), `plugin-events.js` (observer forwarding). `plugins/index.js` = one-entry aggregator and npm/GitHub default (`main`); the old combined `socket-bridge.js` was deleted as redundant. Default socket path moved to `$XDG_RUNTIME_DIR/css-mcp/hooks.sock` (user-writable — an MCP/ACP child process cannot create `/var/run/css-mcp`), legacy `/var/run` kept only if it exists.
+- [done] CONTEXT READING + PLUGIN TESTS — reverse-RPC `session.context.read` push (Python pushes `{id, sessionID}`, JS replies session+messages; fail-safe on client error), `pool.reply()`, `closeBridge()` + `#closed` guards + `EventDebouncer.clear()` for clean test shutdown; `PLUGINS.md` per-plugin reference; README `opencode.json` entries section + PLUGINS.md link; `npm test` (19 tests: inert / E2E vs `client.py --serve` / context-read vs `node:net` brain).
 - Note: the Python brain (socket server, permission module, TaskManager, MCP tools, A2A ingestion) is **out of repo scope** — implement it externally or as a separate project. It may serve BOTH the MCP stdio channel and the Unix socket from one process (two asyncio tasks, shared in-memory state).
 
 ## Known decisions (do not reverse without discussion)
@@ -99,6 +100,8 @@ Key semantics (do not regress):
 
 - `transport.js` — shared singleton: SocketPool, bootstrap/capability gate, rpc, debouncer, session.inject consumer
 - `plugins/` — six per-concern plugins + `index.js` aggregator (no package.json here on purpose: per-file plugin entries resolve to the exact file; `index.js` is the npm/GitHub default)
+- `PLUGINS.md` — per-plugin feature reference (hooks, capabilities, reply contracts, push channels)
+- `tests/` — JS test suites (inert / E2E / context-read), run via `npm test`
 - `package.json` — npm-publishable plugin metadata (`main: plugins/index.js`)
 - `AGENTS.md` — this file
 - `README.md` — user-facing usage (npm / github URL / local symlink)
@@ -143,6 +146,7 @@ Key semantics (do not regress):
 
   Paths are relative to `.opencode/`. `plugins/` has no `package.json`, so each entry resolves to the exact file (a repo-root package.json `main` would otherwise win). Secrets first → the local hardblock runs before the Python gate. `plugins/index.js` loads all six from one entry and is the npm/GitHub default.
 - Loading without a brain is now **safe and inert** — opencode runs normally; no `OPENCODE_FAIL_OPEN` needed. It only matters once a brain has connected and is lost (fail-closed default).
+- **Automated JS tests** (no brain needed): `npm test` runs `node --test "tests/*.test.mjs"` — the inert suite (every plugin no-brain no-op; secrets still blocks), the E2E suite (every plugin against `scripts/client.py --serve` on a temp socket), and the context-read suite (reverse-RPC against a minimal `node:net` brain). Use `npm run check` for `node --check`.
 - `scripts/client.py --serve` is the minimal test brain: it listens on the socket (default `$XDG_RUNTIME_DIR/css-mcp/hooks.sock` or `/tmp/css-mcp/hooks.sock`, or `--socket`), replies to every op (never to `event`), and never denies `pre`/`permission`. Use `--push-channel <ch>` to broadcast a test push every `--push-interval` seconds (default 5). Ctrl-C exits with code 130 and removes the socket.
 
 ## Tech stack / conventions

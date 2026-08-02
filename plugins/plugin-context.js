@@ -7,10 +7,12 @@
  *    live context are synced to the Python brain, which stores the result so
  *    it persists across compaction cycles (the only path that actually
  *    injects into the LLM).
- *  - Full client access — `client.session.messages` / `client.session.get`
- *    are available for reading the actual context; the Python brain decides
- *    what to inject. This plugin is the one place the JS side touches the
- *    context interface, so a future "read current context" flow has a home.
+ *  - Context READING — the Python brain can request the current session
+ *    context at any time by pushing `session.context.read`
+ *    (`{id, sessionID}`); transport.js fetches `client.session.get` +
+ *    `client.session.messages` and replies `{id, ok: true, session, messages}`
+ *    over the socket (reverse-RPC, fail-safe). Use it to diff what the model
+ *    actually saw before deciding what to inject.
  *
  * Ownership: this plugin registers its own `event` hook ONLY for context
  * triggers; fire-and-forget event forwarding lives in plugin-events.js and
