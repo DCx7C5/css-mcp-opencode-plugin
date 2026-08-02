@@ -22,7 +22,7 @@ import {
     warnInert,
     FAIL_OPEN,
     debugEnabled,
-} from "../transport.js"
+} from "./transport.js"
 
 export const server = async ({ client, directory: dir, worktree: wt, project: proj }) => {
     startBridge({ client, directory: dir, worktree: wt, project: proj })

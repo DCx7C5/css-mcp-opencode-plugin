@@ -5,11 +5,10 @@
   "type": "module",
   "main": "plugins/index.js",
   "files": [
-    "transport.js",
     "plugins/"
   ],
   "scripts": {
-    "check": "node --check transport.js && node --check plugins/plugin-hooks.js && node --check plugins/plugin-task.js && node --check plugins/plugin-permission.js && node --check plugins/plugin-context.js && node --check plugins/plugin-secrets.js && node --check plugins/plugin-events.js && node --check plugins/index.js",
+    "check": "node --check plugins/transport.js && node --check plugins/plugin-hooks.js && node --check plugins/plugin-task.js && node --check plugins/plugin-permission.js && node --check plugins/plugin-context.js && node --check plugins/plugin-secrets.js && node --check plugins/plugin-events.js && node --check plugins/index.js",
     "test": "node --test \"tests/*.test.mjs\""
   },
   "peerDependencies": {

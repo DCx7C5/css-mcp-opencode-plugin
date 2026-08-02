@@ -4,10 +4,11 @@
  * This module is the SINGLE shared instance for every plugin in this repo.
  * It owns the socket connection pool, the bootstrap handshake / capability
  * gate, the rpc() wrapper, the event debouncer, and the push consumers
- * (`capabilities.update`, `session.inject`). Per-concern plugins in `plugins/`
- * import from here and register only their own hooks. Because ESM modules are
- * singletons within one opencode process, all plugins share one socket and
- * one capability declaration no matter how many of them are loaded.
+ * (`capabilities.update`, `session.inject`, `session.context.read`). Per-concern
+ * plugins in `plugins/` import from here and register only their own hooks.
+ * Because ESM modules are singletons within one opencode process, all plugins
+ * share one socket and one capability declaration no matter how many of them
+ * are loaded.
  *
  * Lifecycle note (IDE → opencode → MCP/ACP server): the plugin loads before
  * the Python process that serves the socket exists. The pool reconnects with
@@ -160,15 +161,6 @@ function settleBootstrap() {
 /** Monotonic generation: a newer handshake supersedes a stale one. */
 let bootstrapGen = 0
 
-/**
- * Mutable runtime configuration supplied by the Python brain at bootstrap.
- * The `config` hook only mutates at load time, so config deltas travel via
- * the bootstrap reply (and `capabilities.update` pushes); all hooks read
- * this object at call time. Replaced wholesale per handshake/reconnect.
- * @type {Record<string, any>}
- */
-let runtimeConfig = {}
-
 /** True once the bootstrap handshake ever succeeded. While false, a failed
  * handshake means "no Python brain is present" → the bridge runs inert (all
  * hooks proceed normally). Once true, a later handshake failure fail-closes
@@ -178,10 +170,6 @@ let everReady = false
 
 /** One-time warn that the bridge is running inert (no brain ever connected). */
 let warnedInert = false
-
-/** Current config delta (read by the `config` hook in plugin-hooks.js). */
-
-
 /**
  * Run (or re-run) the bootstrap handshake. Re-applied on every reconnect:
  * the caps set is replaced wholesale by the newest reply, and all hooks read
@@ -203,10 +191,6 @@ function startBootstrap() {
                 CAPABILITY_KEYS.filter((key) => msg.capabilities[key] === true),
             )
             bootstrap.status = "ready"
-            if (msg.config && typeof msg.config === "object") {
-                runtimeConfig = msg.config
-                log.debug(`bootstrap: config delta keys=[${Object.keys(runtimeConfig).join(",") || "none"}]`)
-            }
             log.debug(`bootstrap: ready caps=[${[...bootstrap.caps].join(",") || "none"}]`)
         } else {
             bootstrap.status = "failed"
@@ -216,6 +200,14 @@ function startBootstrap() {
                 log.warn("bootstrap: no Python brain connected — bridge inert, all hooks proceed normally")
             }
         }
+        settleBootstrap()
+    }).catch((err) => {
+        // rpc() never rejects today, but if it ever does the in-flight guard
+        // must not stick: every queued hook would block forever in awaitBootstrap.
+        if (gen !== bootstrapGen) return
+        bootstrapInFlight = false
+        bootstrap.status = "failed"
+        log.error(`bootstrap: rpc rejected: ${err.message}`)
         settleBootstrap()
     })
 }
@@ -263,7 +255,7 @@ export const gateNonBlocking = (capKey) => hasCap(capKey)
  * question, opencode turns it into a prompt, the human answers.
  */
 class SessionInjector {
-    /** @type {Map<string, Array<import("@opencode-ai/sdk").TextPartInput>>} */
+    /** @type {Map<string, Array<{ part: import("@opencode-ai/sdk").TextPartInput, extras: Record<string, any> }>>} */
     #queues = new Map()
     /** @type {Set<string>} — dedupe window for inject ids (LRU-ish, bounded). */
     #seen = new Set()
@@ -279,7 +271,10 @@ class SessionInjector {
      */
     push(body, client) {
         if (!body || typeof body !== "object") return
-        const { id, sessionID, kind, content, metadata } = body
+        const {
+            id, sessionID, kind, content, metadata,
+            messageID, model, agent, system, tools,
+        } = body
         if (!id || !sessionID || typeof content !== "string") {
             log.warn(`session.inject: invalid body (id=${id} sessionID=${sessionID})`)
             return
@@ -300,8 +295,16 @@ class SessionInjector {
             synthetic: true,
             ...(metadata && typeof metadata === "object" ? { metadata } : {}),
         }
+        // Optional A2A turn knobs from the push body, forwarded to the SDK.
+        const extras = {
+            ...(messageID ? { messageID } : {}),
+            ...(model ? { model } : {}),
+            ...(agent ? { agent } : {}),
+            ...(system ? { system } : {}),
+            ...(Array.isArray(tools) ? { tools } : {}),
+        }
         if (!this.#queues.has(sessionID)) this.#queues.set(sessionID, [])
-        this.#queues.get(sessionID).push(part)
+        this.#queues.get(sessionID).push({ part, extras })
         log.debug(`session.inject: queued id=${id.slice(0, 8)} kind=${kind} session=${sessionID.slice(0, 8)}`)
 
         // Deliver asynchronously; the push handler must never block on it.
@@ -332,12 +335,13 @@ class SessionInjector {
 
         try {
             while (this.#queues.get(sessionID)?.length) {
-                const parts = this.#queues.get(sessionID)
-                const part = parts.shift()
+                const entries = this.#queues.get(sessionID)
+                const { part, extras } = entries.shift()
                 await client.session.promptAsync({
                     body: {
                         parts: [part],
                         noReply: true,
+                        ...extras,
                     },
                     path: { id: sessionID },
                 })
@@ -409,10 +413,6 @@ function handlePush(channel, body) {
     if (channel === "capabilities.update" && body && typeof body === "object") {
         bootstrap.caps = new Set(CAPABILITY_KEYS.filter((key) => body[key] === true))
         bootstrap.status = "ready"
-        if (body.config && typeof body.config === "object") {
-            runtimeConfig = body.config
-            log.debug(`push capabilities.update: config keys=[${Object.keys(runtimeConfig).join(",") || "none"}]`)
-        }
         settleBootstrap()
         log.debug(`push capabilities.update: caps=[${[...bootstrap.caps].join(",") || "none"}]`)
         return

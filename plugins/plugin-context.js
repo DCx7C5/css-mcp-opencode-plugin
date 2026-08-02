@@ -30,7 +30,7 @@ import {
     isContextTriggerEvent,
     timeouts,
     debugEnabled,
-} from "../transport.js"
+} from "./transport.js"
 
 export const server = async ({ client: c, directory: dir, worktree: wt, project: proj }) => {
     startBridge({ client: c, directory: dir, worktree: wt, project: proj })

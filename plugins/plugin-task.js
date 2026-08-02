@@ -23,7 +23,7 @@ import {
     warnInert,
     FAIL_OPEN,
     debugEnabled,
-} from "../transport.js"
+} from "./transport.js"
 
 export const server = async ({ client, directory: dir, worktree: wt, project: proj }) => {
     startBridge({ client, directory: dir, worktree: wt, project: proj })
@@ -52,7 +52,7 @@ export const server = async ({ client, directory: dir, worktree: wt, project: pr
 
             const gate = await gateBlocking("pre")
             if (gate.kind === "skip") {
-                log(`task-gate: brain has no pre capability, allowing task agent=${input.tool}`)
+                log(`task-gate: brain has no pre capability, allowing task agent=${output.args?.agent ?? output.args?.subagent_type ?? "default"}`)
                 return
             }
             if (gate.kind === "inert") {

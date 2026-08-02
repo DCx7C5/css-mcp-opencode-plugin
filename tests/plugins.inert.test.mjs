@@ -21,7 +21,7 @@ process.env.OPENCODE_BOOTSTRAP_TIMEOUT = "400" // fast inert settle
 process.env.OPENCODE_FAIL_OPEN = "" // default fail-closed, but never-connected → inert
 
 after(async () => {
-    const { closeBridge } = await import("../transport.js")
+    const { closeBridge } = await import("../plugins/transport.js")
     closeBridge()
     rmSync(dir, { recursive: true, force: true })
 })
@@ -67,6 +67,47 @@ test("secrets: allows .env.example and non-secret paths", async () => {
     const normal = { args: { filePath: "src/main.py" } }
     await hooks["tool.execute.before"]({ tool: "edit" }, normal)
     assert.equal(normal.args.filePath, "src/main.py")
+})
+
+test("secrets: blocks .env through paths/vars — no boundary bypass", async () => {
+    const hooks = await load("plugins/plugin-secrets.js")
+
+    // Regression: a .env basename after a path separator or inside a var
+    // expansion used to slip past the bash token regex.
+    for (const cmd of [
+        "cat /proj/.env",
+        'cat "$HOME/.env"',
+        "ls -la /etc/.env",
+        "cat /a/.env.local",
+        "cat /a/.env_backup",
+        "cat /a/.env.production",
+    ]) {
+        await assert.rejects(
+            () => hooks["tool.execute.before"]({ tool: "bash" }, { args: { command: cmd } }),
+            /hardblock/,
+            `expected bash block for: ${cmd}`,
+        )
+    }
+    // File-path variants with full paths / backup names.
+    for (const filePath of ["/proj/.env", "/proj/.env_backup", "/etc/.env.production"]) {
+        await assert.rejects(
+            () => hooks["tool.execute.before"]({ tool: "read" }, { args: { filePath } }),
+            /hardblock/,
+            `expected read block for: ${filePath}`,
+        )
+    }
+    // .env.example still allowed anywhere; os.environ/URLs not over-blocked.
+    const okExample = { args: { command: "cat /proj/.env.example" } }
+    await hooks["tool.execute.before"]({ tool: "bash" }, okExample)
+    assert.equal(okExample.args.command, "cat /proj/.env.example")
+
+    const okEnv = { args: { command: 'python -c "import os; print(os.environ)"' } }
+    await hooks["tool.execute.before"]({ tool: "bash" }, okEnv)
+    assert.equal(okEnv.args.command, 'python -c "import os; print(os.environ)"')
+
+    const okUrl = { args: { command: "curl https://api.example.com/v1/env" } }
+    await hooks["tool.execute.before"]({ tool: "bash" }, okUrl)
+    assert.equal(okUrl.args.command, "curl https://api.example.com/v1/env")
 })
 
 test("secrets: permission.ask denies secret patterns, leaves others ask", async () => {

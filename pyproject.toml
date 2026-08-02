@@ -1,6 +1,6 @@
 [project]
 name = "css-mcp-opencode-plugin"
-version = "0.1.0"
+version = "0.2.0"
 description = "OpenCode ↔ Python bridge plugin: JS transport over a Unix socket + NDJSON test client"
 requires-python = ">=3.14"
 dependencies = [

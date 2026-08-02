@@ -1,7 +1,7 @@
 # Plugins — feature reference
 
 This repo ships **six per-concern plugins** plus a shared transport. Each plugin
-registers only its own hook surface; they all import the `transport.js` ESM
+registers only its own hook surface; they all import the `plugins/transport.js` ESM
 singleton, so every plugin in a process shares **one** socket, **one** bootstrap
 handshake, and **one** capability gate — loading one plugin or all six is
 functionally identical.
@@ -121,6 +121,11 @@ replies over the socket (a normal `{id, ok, session, messages}` response):
 saw. Use it to diff context before deciding what to inject. Fail-safe: any
 client error (or no active client) replies `{ok:false, error:{code, message}}`.
 
+`session.inject` accepts optional A2A turn knobs in the push body —
+`messageID`, `model`, `agent`, `system`, `tools` — which transport.js forwards
+into the `promptAsync` body so the Python brain can steer the injected turn
+(target model/agent, custom system prompt, allowed tools).
+
 ---
 
 ## plugin-events.js — observer-only event forwarding
@@ -151,7 +156,7 @@ while sharing one transport. Behavior is identical to the per-file entries.
 
 ---
 
-## transport.js — shared singleton API
+## plugins/transport.js — shared singleton API
 
 | export | purpose |
 |--------|---------|
@@ -184,9 +189,16 @@ uv run --group test pytest   # scripts/client.py smoke tests
 ```
 
 - `tests/plugins.inert.test.mjs` — every plugin with **no brain** (must be a
-  no-op; secrets must still block).
+  no-op; secrets must still block, including path/var `.env` shapes).
 - `tests/plugins.e2e.test.mjs` — every plugin against `scripts/client.py
   --serve` (bootstrap → RPC path → allow/unchanged semantics).
 - `tests/plugins.context-read.test.mjs` — the `session.context.read`
   reverse-RPC (success, client error, malformed, no-client) against a minimal
   `node:net` brain.
+- `tests/plugins.failclosed.test.mjs` / `tests/plugins.failopen.test.mjs` —
+  a brain connects then dies: `pre` throws / `permission` denies fast
+  (fail-closed, circuit breaker) and `OPENCODE_FAIL_OPEN=1` opts out.
+- `tests/plugins.inject.test.mjs` — `session.inject` FIFO + dedupe +
+  fail-safe + A2A knob forwarding.
+- `tests/plugins.capabilities.test.mjs` — `capabilities.update` live
+  enable/revoke of a hook capability.

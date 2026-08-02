@@ -19,14 +19,18 @@
  *    (cat/less/curl/source …) is blocked rather than risk a leak.
  */
 
-import { startBridge } from "../transport.js"
+import { startBridge } from "./transport.js"
 
-/** Basename like `.env` or `.env.local`, `.env.production`, … (also glob forms). */
-const SECRET_FILE_RE = /(^|[/\\])\.env(?:\.[A-Za-z0-9_*?\-]+)?[*?]?$/
+/** Basename like `.env`, `.env.local`, `.env_backup`, `.env.production` or glob
+ * forms (`.env*`, `.env?`). `.env.example*` is excluded (see EXAMPLE_FILE_RE).
+ * NOTE: the leading boundary includes `/` — `cat /proj/.env` must be blocked. */
+const SECRET_FILE_RE = /(^|[/\\])\.env(?!\.example)[A-Za-z0-9_.*?\-]*$/
 /** Example files are safe to read — never flag them (also glob forms). */
-const EXAMPLE_FILE_RE = /\.env\.example(?:\.[A-Za-z0-9_*?\-]+)?[*?]?$/i
-/** A `.env` token inside a shell command (word-bounded). */
-const BASH_SECRET_TOKEN_RE = /(^|[\s"'=&|;()])\.env(?:\.[A-Za-z0-9_-]+)?($|[\s"'=&|;()])/
+const EXAMPLE_FILE_RE = /\.env\.example(?:\.[A-Za-z0-9_*?\-]+)?[*]?$/i
+/** A `.env` basename token inside a shell command (word- or path-bounded).
+ * Both boundaries include `/`: `.env` after a path separator is exactly the
+ * secret file (`cat /proj/.env`, `cat "$HOME/.env"`, `ls /etc/.env`). */
+const BASH_SECRET_TOKEN_RE = /(^|[/\s"'=&|;()])\.env(?!\.example)(?:[A-Za-z0-9_.\-]*)?($|[/\s"'=&|;()])/
 
 /** Which tools take a file path (in args.filePath / args.path / args.pattern). */
 const FILE_PATH_TOOLS = new Set(["read", "edit", "write", "glob", "grep", "list"])

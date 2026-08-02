@@ -44,6 +44,7 @@ before(async () => {
     brain = spawn("uv", ["run", "python", "scripts/client.py", "--serve", "--socket", sock], {
         cwd: root,
         stdio: ["ignore", "pipe", "inherit"],
+        detached: true,
     })
     await waitForSocket(sock)
 
@@ -58,8 +59,12 @@ before(async () => {
 })
 
 after(async () => {
-    brain?.kill("SIGINT")
-    const { closeBridge } = await import("../transport.js")
+    try {
+        process.kill(-brain.pid, "SIGINT") // detached → whole process group
+    } catch {
+        // ESRCH: already dead.
+    }
+    const { closeBridge } = await import("../plugins/transport.js")
     closeBridge()
     await new Promise((r) => setTimeout(r, 200))
     rmSync(dir, { recursive: true, force: true })

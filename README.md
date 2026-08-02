@@ -5,7 +5,7 @@ Unix socket; all decision logic lives in a Python "brain".
 
 **Architecture: Python brain, JS gate — split into per-concern plugins.**
 
-- **Shared transport** (`transport.js`) — one socket connection pool, one
+- **Shared transport** (`plugins/transport.js`) — one socket connection pool, one
   bootstrap handshake, one capability gate, one event debouncer, one
   `session.inject` consumer. Every plugin shares it (ESM singletons), so loading
   one plugin or all six is functionally identical.
@@ -119,6 +119,10 @@ Order matters: `plugin-secrets.js` first so the local hardblock runs before the
 Python gate. To load all of them from a single entry instead, point at
 `plugins/index.js` (opencode loads every `server`-shaped export as a separate
 plugin) — this is also the npm/GitHub default.
+
+> ⚠️ Load **either** the per-file entries **or** the aggregator
+> (`plugins/index.js`) — never both. Each hook would register twice, so every
+> tool invocation would fire **two** `pre` RPCs at the Python brain.
 
 ### opencode.json entries — every load form
 

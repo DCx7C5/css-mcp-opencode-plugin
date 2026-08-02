@@ -25,7 +25,7 @@ import {
     pushEvent,
     timeouts,
     debugEnabled,
-} from "../transport.js"
+} from "./transport.js"
 
 export const server = async ({ client, directory: dir, worktree: wt, project }) => {
     startBridge({ client, directory: dir, worktree: wt, project })

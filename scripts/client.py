@@ -121,7 +121,7 @@ class Response(msgspec.Struct):
 
 
 class BridgeError(Exception):
-    """Base error for socket-bridge client failures."""
+    """Base error for css-mcp bridge client failures."""
 
 
 class ReplyTimeout(BridgeError):

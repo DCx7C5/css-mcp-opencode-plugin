@@ -87,7 +87,7 @@ before(async () => {
 
 after(async () => {
     brain?.close()
-    const { closeBridge } = await import("../transport.js")
+    const { closeBridge } = await import("../plugins/transport.js")
     closeBridge()
     rmSync(dir, { recursive: true, force: true })
 })
