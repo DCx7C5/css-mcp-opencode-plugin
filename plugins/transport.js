@@ -5,10 +5,11 @@
  * It owns the socket connection pool, the bootstrap handshake / capability
  * gate, the rpc() wrapper, the event debouncer, and the push consumers
  * (`capabilities.update`, `session.inject`, `session.context.read`,
- * `task.launch`). Per-concern plugins in `plugins/` import from here and
- * register only their own hooks. Because ESM modules are singletons within
- * one opencode process, all plugins share one socket and one capability
- * declaration no matter how many of them are loaded.
+ * `task.launch`, `session.intel`, `session.summarize`). Per-concern plugins
+ * in `plugins/` import from here and register only their own hooks. Because
+ * ESM modules are singletons within one opencode process, all plugins share
+ * one socket and one capability declaration no matter how many of them are
+ * loaded.
  *
  * Lifecycle note (IDE → opencode → MCP/ACP server): the plugin loads before
  * the Python process that serves the socket exists. The pool reconnects with
@@ -72,6 +73,10 @@ const RECONNECT_MAX_MS = 5_000
 const DEBOUNCE_MS = 50
 const MAX_DEBOUNCE_BATCH = 20
 const SHORT_TIMEOUT_MS = 2_000
+/** Bounds for `session.intel` recent-text extraction (never ship the dump). */
+const RECENT_MESSAGE_COUNT = 20
+const RECENT_PART_CHARS = 2_000
+const RECENT_CHARS = 12_000
 
 /** Ops the Python server NEVER replies to (fire-and-forget; no orphan log). */
 const NO_REPLY_OPS = new Set(["event"])
@@ -524,6 +529,141 @@ async function launchTask(id, body) {
 }
 
 /**
+ * Bounded session intel fetched from the SDK client: message stats, recent
+ * text parts, the file diff and the todo list. This powers the compaction
+ * "handshake" — the brain sees exactly what is about to be summarized —
+ * and the `session.intel` reverse-RPC for on-demand reads. Every item is
+ * individually fail-safe: a fetch error yields `null` (or `""` for recent)
+ * so a broken surface never breaks the rest.
+ *
+ * Bounds: `recent` keeps the last RECENT_MESSAGE_COUNT text parts, each
+ * trimmed to RECENT_PART_CHARS, joined and capped at RECENT_CHARS — never
+ * ships the full context over the socket (the LLM summarizer already has
+ * it; the brain needs the shape, not the dump). Use `session.context.read`
+ * for the full message list.
+ *
+ * @param {string} sessionID
+ * @param {string[]|null} [what] Which intel to fetch — subset of
+ *   `["stats", "recent", "diff", "todo"]`; default fetches all.
+ * @returns {Promise<Record<string, any>>} `{stats?, recent?, diff?, todo?}`
+ */
+async function readSessionIntel(sessionID, what = null) {
+    const client = activeClient
+    const keys = what && Array.isArray(what) && what.length ? what : ["stats", "recent", "diff", "todo"]
+    const out = {}
+
+    let messagesRes = null
+    for (const key of keys) {
+        if (key === "stats" || key === "recent") {
+            if (messagesRes === null) {
+                try {
+                    messagesRes = await client?.session?.messages?.({ path: { id: sessionID } })
+                } catch (err) {
+                    log.debug(`session.intel: messages fetch failed for ${sessionID.slice(0, 8)}: ${err.message}`)
+                    messagesRes = { data: [] }
+                }
+            }
+            const messages = messagesRes?.data ?? []
+            if (key === "stats") {
+                const byRole = {}
+                let lastUpdated = 0
+                for (const m of messages) {
+                    const role = m?.info?.role ?? m?.role ?? "unknown"
+                    byRole[role] = (byRole[role] ?? 0) + 1
+                    const t = Number(m?.info?.time?.updated ?? m?.time?.updated ?? 0)
+                    if (t > lastUpdated) lastUpdated = t
+                }
+                out.stats = { total: messages.length, byRole, lastUpdated }
+            } else {
+                const texts = []
+                for (const m of messages) {
+                    for (const p of m?.parts ?? m?.data?.parts ?? []) {
+                        if (p?.type === "text" && typeof p?.text === "string") {
+                            texts.push(p.text.slice(0, RECENT_PART_CHARS))
+                        }
+                    }
+                }
+                out.recent = texts.slice(-RECENT_MESSAGE_COUNT).join("\n\n").slice(-RECENT_CHARS)
+            }
+            continue
+        }
+        try {
+            if (key === "diff") {
+                const res = await client?.session?.diff?.({ path: { id: sessionID } })
+                out.diff = res?.data ?? []
+            } else if (key === "todo") {
+                const res = await client?.session?.todo?.({ path: { id: sessionID } })
+                out.todo = res?.data ?? []
+            } else {
+                out[key] = null
+            }
+        } catch (err) {
+            log.debug(`session.intel: ${key} fetch failed for ${sessionID.slice(0, 8)}: ${err.message}`)
+            out[key] = key === "recent" ? "" : null
+        }
+    }
+    return out
+}
+
+/** Export for plugins (compaction hook enrichment). */
+export const sessionIntel = (sessionID, what = null) => readSessionIntel(sessionID, what)
+
+/**
+ * Reverse-RPC: Python pushed `session.intel` and expects bounded session
+ * intel back (`{id, ok, sessionID, stats?, recent?, diff?, todo?}`) — see
+ * `readSessionIntel` for shapes and bounds. Fail-safe: no client or client
+ * error answers `{ok:false, error:{code, message}}`.
+ * @param {string} id Reply id echoed from the push body.
+ * @param {string} sessionID Session to inspect.
+ * @param {string[]|null} what Intel keys to fetch (default all).
+ */
+async function replySessionIntel(id, sessionID, what) {
+    if (!activeClient) {
+        log.error("session.intel: no active client (no plugin instance initialized the bridge)")
+        pool.reply(id, false, { error: { code: "no_client", message: "no plugin instance initialized the bridge" } })
+        return
+    }
+    const intel = await readSessionIntel(sessionID, what)
+    log.debug(`session.intel: replied session=${sessionID.slice(0, 8)} keys=[${Object.keys(intel).join(",") || "none"}]`)
+    pool.reply(id, true, { sessionID, ...intel })
+}
+
+/**
+ * Reverse-RPC: Python pushed `session.summarize` to force a compaction
+ * summarization (`client.session.summarize` — the summarizer runs async in
+ * opencode, so this only kicks it off). Replies `{id, ok, sessionID,
+ * started: true}`; fail-safe `{ok:false, error}` on client failure.
+ * @param {string} id Reply id echoed from the push body.
+ * @param {string} sessionID Session to summarize.
+ * @param {{ providerID?: string, modelID?: string }|null} [model] Optional
+ *   summarizer model override (defaults to opencode's choice).
+ */
+async function summarizeSession(id, sessionID, model) {
+    const client = activeClient
+    if (!client) {
+        log.error("session.summarize: no active client (no plugin instance initialized the bridge)")
+        pool.reply(id, false, { error: { code: "no_client", message: "no plugin instance initialized the bridge" } })
+        return
+    }
+    try {
+        const res = await client.session.summarize({
+            path: { id: sessionID },
+            body: model && typeof model === "object" ? { providerID: model.providerID, modelID: model.modelID } : undefined,
+        })
+        if (res?.error) {
+            log.error(`session.summarize: client error session=${sessionID.slice(0, 8)}: ${res.error.message ?? String(res.error)}`)
+            pool.reply(id, false, { error: { code: "client_error", message: res.error.message ?? String(res.error), sessionID } })
+            return
+        }
+        log.debug(`session.summarize: kicked off session=${sessionID.slice(0, 8)}`)
+        pool.reply(id, true, { sessionID, started: true })
+    } catch (err) {
+        log.error(`session.summarize: exception session=${sessionID.slice(0, 8)}: ${err.message}`)
+        pool.reply(id, false, { error: { code: "client_error", message: err.message, sessionID } })
+    }
+}
+
+/**
  * Handle a push from the Python server. Push dispatch runs BEFORE orphan
  * matching in the pool data handler.
  * @param {string} channel
@@ -554,6 +694,22 @@ function handlePush(channel, body) {
             void launchTask(body.id, body)
         } else {
             log.error("task.launch: missing id, ignored")
+        }
+        return
+    }
+    if (channel === "session.intel" && body && typeof body === "object") {
+        if (typeof body.id === "string" && typeof body.sessionID === "string") {
+            void replySessionIntel(body.id, body.sessionID, body.what)
+        } else {
+            log.error("session.intel: missing id/sessionID, ignored")
+        }
+        return
+    }
+    if (channel === "session.summarize" && body && typeof body === "object") {
+        if (typeof body.id === "string" && typeof body.sessionID === "string") {
+            void summarizeSession(body.id, body.sessionID, body.model ?? null)
+        } else {
+            log.error("session.summarize: missing id/sessionID, ignored")
         }
         return
     }

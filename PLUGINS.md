@@ -156,6 +156,45 @@ forever) replies `{ok:false, error:{code:"timeout", sessionID}}` and aborts
 the session best-effort via `client.session.abort`. First reply wins — a
 timeout reply is never followed by a late result reply.
 
+**Session intel (reverse-RPC):** bounded reads of the session state, either
+on demand or as the compaction handshake:
+
+```json
+{ "type": "push", "channel": "session.intel", "body": { "id": "…", "sessionID": "…", "what": ["stats", "recent", "diff", "todo"] } }
+```
+
+transport.js replies `{id, ok, sessionID, stats?, recent?, diff?, todo?}`:
+- `stats` — `{total, byRole, lastUpdated}` (message count / role split / last activity)
+- `recent` — the last 20 text parts, each trimmed, joined and capped at
+  12k chars — the shape, never the full dump (use `session.context.read`
+  for the full message list)
+- `diff` — `FileDiff[]` (`{file, before, after, additions, deletions}`)
+- `todo` — `Todo[]` (`{id, content, status, priority}`)
+
+Every item is fail-safe: a broken SDK surface yields `null`/`""` without
+failing the request.
+
+**Forced summarization (reverse-RPC):** the brain can kick off a compaction
+summarization on demand:
+
+```json
+{ "type": "push", "channel": "session.summarize", "body": { "id": "…", "sessionID": "…", "model": { "providerID": "…", "modelID": "…" } } }
+```
+
+replies `{id, ok, sessionID, started: true}` — the summarizer runs async in
+opencode, so this only starts it (use `session.intel` / event forwarding to
+watch for `session.compacted`).
+
+**Compaction handshake:** when opencode's context window is full and
+`experimental.session.compacting` fires, plugin-context.js fetches that same
+bounded intel (`session: {stats, recent, diff, todo}`) and includes it in
+the `context` RPC body before asking the brain for the compaction decision.
+The brain replies exactly as before — `{prompt}` replaces the entire
+compaction prompt, `{context}` injects items that survive the compaction,
+nothing uses opencode's default — but now it can base the decision on what
+is actually being summarized (e.g. persist the live todo list into
+`context` so it survives, or craft a diff-aware continuation prompt).
+
 ---
 
 ## plugin-events.js — observer-only event forwarding
@@ -207,8 +246,9 @@ while sharing one transport. Behavior is identical to the per-file entries.
 Push channels consumed by transport.js: `capabilities.update` (live cap
 re-apply + config), `session.inject` (live content injection via
 `client.session.promptAsync`, FIFO/dedupe/fail-safe), `session.context.read`
-(reverse-RPC above), `task.launch` (reverse-RPC above). `permissions.update`
-is informational — permission rules live in the Python brain, there is
+(reverse-RPC above), `task.launch` (reverse-RPC above), `session.intel` and
+`session.summarize` (reverse-RPCs above). `permissions.update` is
+informational — permission rules live in the Python brain, there is
 nothing to cache JS-side.
 
 ## Testing
@@ -236,3 +276,6 @@ uv run --group test pytest   # scripts/client.py smoke tests
 - `tests/plugins.task.test.mjs` — `task.launch` reverse-RPC: create + prompt
   call shapes, result extraction, error / invalid / timeout / no-client
   paths, malformed body ignored.
+- `tests/plugins.session.test.mjs` — `session.intel` reads (stats/recent/
+  diff/todo, `what` filter, per-item fail-safe), `session.summarize`
+  kick-off + model override, and the compaction-handshake `context` RPC body.
