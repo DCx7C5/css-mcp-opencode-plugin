@@ -32,6 +32,7 @@ import {
     timeouts,
     warnInert,
     FAIL_OPEN,
+    PLUGIN_PREFIX,
     debugEnabled,
 } from "./transport.js"
 
@@ -56,7 +57,7 @@ export const server = async ({ client: c, directory: dir, worktree: wt, project:
                 },
                 directory: directory() ?? dir,
                 worktree: worktree() ?? wt,
-            })
+            }, PLUGIN_PREFIX.permission)
 
             const gate = await gateBlocking("permission")
             if (gate.kind === "skip") {
@@ -95,6 +96,7 @@ export const server = async ({ client: c, directory: dir, worktree: wt, project:
                     directory: directory() ?? dir,
                 },
                 timeouts.permission,
+                { prefix: PLUGIN_PREFIX.permission },
             ))
 
             if (!decision) {

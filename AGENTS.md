@@ -29,6 +29,13 @@ Message classes:
 - Request JS→Py: `{id, op, body}` (id = UUID v4)
 - Response Py→JS: `{id, ok, ...payload}` or `{id, ok:false, error:{code, message}}`
 - Push Py→JS: `{type:"push", channel, body}` — never replied to, no id
+- Per-plugin wire prefix: every JS→Py line MAY carry the owning plugin letter
+  followed by `:` — `e:` (plugin-events), `c:` (plugin-context), `p:`
+  (plugin-permission), `t:` (plugin-task), `h:` (plugin-hooks), `s:`
+  (plugin-secrets). Bridge-level ops (`bootstrap`, `config`) and every Py→JS
+  line are plain JSON; the server strips `<letter>:` before decoding.
+  plugin-secrets never talks to Python (local-only hardblock), so no `s:`
+  bytes are emitted today.
 
 Ops table (reply / timeout / blocking):
 | op | reply | timeout | blocks? |

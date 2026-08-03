@@ -1,3 +1,4 @@
+# pyright: reportAny=false, reportUnnecessaryTypeIgnoreComment=false
 """Smoke tests for the socket-bridge NDJSON test client (scripts/client.py)."""
 
 import importlib.util
@@ -33,6 +34,23 @@ def test_ops_cover_protocol() -> None:
             "event",
         }
     )
+
+
+def test_strip_plugin_prefix_removes_each_plugin_letter() -> None:
+    client = _load_client()
+    assert client.PLUGIN_PREFIXES == frozenset({"e", "c", "p", "t", "h", "s"})
+    for letter in "ecpths":
+        assert client.strip_plugin_prefix(f"{letter}:{{\"op\": \"pre\"}}") == '{"op": "pre"}'
+
+
+def test_strip_plugin_prefix_passthrough_without_prefix() -> None:
+    client = _load_client()
+    assert client.strip_plugin_prefix('{"op": "bootstrap"}') == '{"op": "bootstrap"}'
+    # Unknown letters are not prefixes — left untouched.
+    assert client.strip_plugin_prefix('z:{"op": "pre"}') == 'z:{"op": "pre"}'
+    # A colon-prefix shape only at the start is stripped; mid-string colons
+    # are content.
+    assert client.strip_plugin_prefix('{"x": "h:y"}') == '{"x": "h:y"}'
 
 
 def test_request_roundtrip() -> None:

@@ -1,9 +1,15 @@
+# pyright: reportUnannotatedClassAttribute=false, reportUnusedCallResult=false, reportAny=false
 """NDJSON test client for the OpenCode ↔ Python socket bridge.
 
 Implements the v0.4 protocol from AGENTS.md:
 
 - Transport: Unix socket, NDJSON (``\\n``-delimited, UTF-8).
 - Request (JS→Py): ``{"id": "<uuid4>", "op": "<op>", "body": {...}}``.
+- Per-plugin prefix: every JS→Py line MAY be prefixed with the owning plugin
+  letter followed by ``:`` (``e:`` plugin-events, ``c:`` plugin-context,
+  ``p:`` plugin-permission, ``t:`` plugin-task, ``h:`` plugin-hooks,
+  ``s:`` plugin-secrets). Bridge-level ops (``bootstrap``, ``config``) and
+  every Py→JS line are plain JSON. The prefix is stripped before decoding.
 - Response (Py→JS): ``{"id": "<id>", "ok": true, ...payload}`` or
   ``{"id": "<id>", "ok": false, "error": {"code": ..., "message": ...}}``.
 - Push (Py→JS): ``{"type": "push", "channel": ..., "body": ...}`` — never
@@ -76,6 +82,32 @@ def default_socket() -> str:
 DEFAULT_SOCKET = default_socket()
 
 DEFAULT_PUSH_INTERVAL = 5.0
+
+# Per-plugin wire prefixes (JS→Py only): ``<letter>:<json>``. The owning
+# plugin file's letter tags every request/event/reply line so the brain can
+# attribute traffic to a plugin (plugin-events `e`, plugin-context `c`,
+# plugin-permission `p`, plugin-task `t`, plugin-hooks `h`, plugin-secrets
+# `s`). Bridge-level ops (`bootstrap`, `config`) and all Py→JS lines are
+# plain JSON.
+PLUGIN_PREFIXES: frozenset[str] = frozenset({"e", "c", "p", "t", "h", "s"})
+
+
+def strip_plugin_prefix(text: str) -> str:
+    """Strip an optional per-plugin prefix from one JS→Py wire line.
+
+    A line is ``<letter>:<json>`` when a plugin owns it, or plain ``<json>``
+    for bridge-level ops. Py→JS lines are always plain JSON; the strip is a
+    no-op for them, so it is safe to apply to any incoming line.
+
+    Args:
+        text: One wire line (without the trailing newline).
+
+    Returns:
+        The line with the prefix removed when present.
+    """
+    if len(text) >= 2 and text[0] in PLUGIN_PREFIXES and text[1] == ":":
+        return text[2:]
+    return text
 
 # Server-side dedupe limits (spec): replay double-apply is prevented by
 # remembering request ids briefly (LRU ~1000, TTL 30s).
@@ -337,7 +369,7 @@ async def run_stream(socket_path: str, timeout: float) -> int:
         if not line.strip():
             continue
         try:
-            raw = msgspec.json.decode(line, type=dict[str, object])
+            raw = msgspec.json.decode(strip_plugin_prefix(line), type=dict[str, object])
         except msgspec.MsgspecError as exc:
             print(f"ERROR: invalid JSON on stdin: {exc}", file=sys.stderr)
             code = 2
@@ -448,7 +480,7 @@ async def _serve_connection(
             line = await reader.readline()
             if not line:
                 break
-            text = line.decode("utf-8")
+            text = strip_plugin_prefix(line.decode("utf-8"))
             try:
                 raw = msgspec.json.decode(text, type=dict[str, object])
                 request = request_from_dict(raw)

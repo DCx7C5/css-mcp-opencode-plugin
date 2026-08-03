@@ -24,6 +24,7 @@ import {
     okReply,
     pushEvent,
     timeouts,
+    PLUGIN_PREFIX,
     debugEnabled,
 } from "./transport.js"
 
@@ -49,7 +50,7 @@ export const server = async ({ client, directory: dir, worktree: wt, project }) 
                     // dropping the event — every tracked event reaches the
                     // brain in every capability state.
                     log(`event: brain has no eventPipeline capability, fire-and-forget ${type}`)
-                    pushEvent({ type, properties, directory: directory() ?? dir, worktree: worktree() ?? wt })
+                    pushEvent({ type, properties, directory: directory() ?? dir, worktree: worktree() ?? wt }, PLUGIN_PREFIX.events)
                     return
                 }
                 // Synchronous pipeline: pre-hooks → store → post-hooks.
@@ -60,6 +61,7 @@ export const server = async ({ client, directory: dir, worktree: wt, project }) 
                     "event.pipeline",
                     { type, properties, directory: directory() ?? dir, worktree: worktree() ?? wt },
                     timeouts.pipeline,
+                    { prefix: PLUGIN_PREFIX.events },
                 ))
 
                 if (result?.blocked) {
@@ -70,7 +72,7 @@ export const server = async ({ client, directory: dir, worktree: wt, project }) 
                 log(`event: pipeline ok, hooks_ran=${(result?.hooks_ran ?? []).join(",") || "none"}`)
             } else {
                 // Non-hookable events: debounced fire-and-forget.
-                pushEvent({ type, properties, directory: directory() ?? dir, worktree: worktree() ?? wt })
+                pushEvent({ type, properties, directory: directory() ?? dir, worktree: worktree() ?? wt }, PLUGIN_PREFIX.events)
             }
         },
     }

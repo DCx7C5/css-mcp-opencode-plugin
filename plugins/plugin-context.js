@@ -38,6 +38,7 @@ import {
     sessionIntel,
     isContextTriggerEvent,
     timeouts,
+    PLUGIN_PREFIX,
     debugEnabled,
 } from "./transport.js"
 
@@ -73,6 +74,7 @@ export const server = async ({ client: c, directory: dir, worktree: wt, project:
                     session: intel,
                 },
                 timeouts.context,
+                { prefix: PLUGIN_PREFIX.context },
             ))
 
             if (!reply) {
@@ -114,7 +116,7 @@ export const server = async ({ client: c, directory: dir, worktree: wt, project:
                 "context",
                 { reason: type, properties, directory: directory() ?? dir, worktree: worktree() ?? wt },
                 timeouts.context,
-                { wait: false },
+                { wait: false, prefix: PLUGIN_PREFIX.context },
             ).catch((err) => {
                 log(`event: context sync failed for ${type}: ${err.message}`)
             })

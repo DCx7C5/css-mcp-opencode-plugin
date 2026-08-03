@@ -61,7 +61,8 @@ before(async () => {
                 const line = buf.slice(0, idx).toString()
                 buf = buf.slice(idx + 1)
                 if (!line.trim()) continue
-                const msg = JSON.parse(line)
+                // Strip the per-plugin wire prefix (<letter>:) from JS→Py lines.
+                const msg = JSON.parse(line.replace(/^[ecpths]:/, ""))
                 if (msg.op === "bootstrap") {
                     socket.write(
                         JSON.stringify({

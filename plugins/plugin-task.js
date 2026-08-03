@@ -30,6 +30,7 @@ import {
     timeouts,
     warnInert,
     FAIL_OPEN,
+    PLUGIN_PREFIX,
     debugEnabled,
 } from "./transport.js"
 
@@ -85,7 +86,7 @@ export const server = async ({ client, directory: dir, worktree: wt, project: pr
                 },
                 directory: directory() ?? dir,
                 worktree: worktree() ?? wt,
-            })
+            }, PLUGIN_PREFIX.task)
 
             const gate = await gateBlocking("pre")
             if (gate.kind === "skip") {
@@ -132,6 +133,7 @@ export const server = async ({ client, directory: dir, worktree: wt, project: pr
                     ...(await taskIntel()),
                 },
                 timeouts.pre,
+                { prefix: PLUGIN_PREFIX.task },
             ))
 
             if (!decision) {

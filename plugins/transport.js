@@ -81,6 +81,22 @@ const RECENT_CHARS = 12_000
 /** Ops the Python server NEVER replies to (fire-and-forget; no orphan log). */
 const NO_REPLY_OPS = new Set(["event"])
 
+/** Per-plugin wire prefixes: every JS→Python line carries the letter of the
+ *  plugin file that produced it (plugin-hooks `h`, plugin-task `t`,
+ *  plugin-permission `p`, plugin-context `c`, plugin-events `e`,
+ *  plugin-secrets `s`). The Python brain strips `<letter>:` before decoding.
+ *  Bridge-level ops (`bootstrap`, `config`) stay unprefixed; Python→JS lines
+ *  are always plain JSON. plugin-secrets is the local-only hardblock and
+ *  never talks to Python, so no `s:`-prefixed bytes are emitted today. */
+export const PLUGIN_PREFIX = {
+    hooks: "h",
+    task: "t",
+    permission: "p",
+    context: "c",
+    events: "e",
+    secrets: "s",
+}
+
 /** Consecutive failed reconnect cycles before the circuit breaker opens. */
 const CIRCUIT_BREAKER_LIMIT = 3
 
@@ -377,12 +393,13 @@ const injector = new SessionInjector()
  *
  * @param {string} id Reply id echoed from the push body.
  * @param {string} sessionID Session to read.
+ * @param {string} [prefix] Owning plugin letter for the reply line.
  */
-async function readSessionContext(id, sessionID) {
+async function readSessionContext(id, sessionID, prefix = "") {
     const client = activeClient
     if (!client) {
         log.error("session.context.read: no active client (no plugin instance initialized the bridge)")
-        pool.reply(id, false, { error: { code: "no_client", message: "no plugin instance initialized the bridge" } })
+        pool.reply(id, false, { error: { code: "no_client", message: "no plugin instance initialized the bridge" } }, prefix)
         return
     }
     try {
@@ -393,7 +410,7 @@ async function readSessionContext(id, sessionID) {
         const err = sessionRes?.error ?? messagesRes?.error
         if (err) {
             log.error(`session.context.read: client error session=${sessionID.slice(0, 8)}: ${err.message ?? String(err)}`)
-            pool.reply(id, false, { error: { code: "client_error", message: err.message ?? String(err) } })
+            pool.reply(id, false, { error: { code: "client_error", message: err.message ?? String(err) } }, prefix)
             return
         }
         const messages = messagesRes?.data
@@ -401,10 +418,10 @@ async function readSessionContext(id, sessionID) {
             `session.context.read: replied session=${sessionID.slice(0, 8)}`
             + ` messages=${Array.isArray(messages) ? messages.length : "?"}`,
         )
-        pool.reply(id, true, { session: sessionRes?.data, messages })
+        pool.reply(id, true, { session: sessionRes?.data, messages }, prefix)
     } catch (err) {
         log.error(`session.context.read: exception session=${sessionID.slice(0, 8)}: ${err.message}`)
-        pool.reply(id, false, { error: { code: "client_error", message: err.message } })
+        pool.reply(id, false, { error: { code: "client_error", message: err.message } }, prefix)
     }
 }
 
@@ -430,17 +447,18 @@ async function readSessionContext(id, sessionID) {
  *
  * @param {string} id Reply id echoed from the push body.
  * @param {object} body
+ * @param {string} [prefix] Owning plugin letter for the reply line.
  */
-async function launchTask(id, body) {
+async function launchTask(id, body, prefix = "") {
     const client = activeClient
     if (!client) {
         log.error("task.launch: no active client (no plugin instance initialized the bridge)")
-        pool.reply(id, false, { error: { code: "no_client", message: "no plugin instance initialized the bridge" } })
+        pool.reply(id, false, { error: { code: "no_client", message: "no plugin instance initialized the bridge" } }, prefix)
         return
     }
     const prompt = typeof body.prompt === "string" ? body.prompt.trim() : ""
     if (!prompt) {
-        pool.reply(id, false, { error: { code: "invalid_request", message: "task.launch requires a non-empty prompt" } })
+        pool.reply(id, false, { error: { code: "invalid_request", message: "task.launch requires a non-empty prompt" } }, prefix)
         return
     }
     const agent = typeof body.agent === "string" && body.agent ? body.agent : undefined
@@ -463,17 +481,17 @@ async function launchTask(id, body) {
         })
         if (createRes?.error) {
             log.error(`task.launch: create error: ${createRes.error.message ?? String(createRes.error)}`)
-            pool.reply(id, false, { error: { code: "client_error", message: createRes.error.message ?? String(createRes.error) } })
+            pool.reply(id, false, { error: { code: "client_error", message: createRes.error.message ?? String(createRes.error) } }, prefix)
             return
         }
         sessionID = createRes?.data?.id
         if (!sessionID) {
-            pool.reply(id, false, { error: { code: "client_error", message: "session.create returned no id" } })
+            pool.reply(id, false, { error: { code: "client_error", message: "session.create returned no id" } }, prefix)
             return
         }
     } catch (err) {
         log.error(`task.launch: create exception: ${err.message}`)
-        pool.reply(id, false, { error: { code: "client_error", message: err.message } })
+        pool.reply(id, false, { error: { code: "client_error", message: err.message } }, prefix)
         return
     }
 
@@ -482,7 +500,7 @@ async function launchTask(id, body) {
     const reply = (ok, payload) => {
         if (replied) return
         replied = true
-        pool.reply(id, ok, payload)
+        pool.reply(id, ok, payload, prefix)
     }
 
     log.debug(`task.launch: created session=${sessionID.slice(0, 8)} agent=${agent ?? "default"} timeoutMs=${timeoutMs}`)
@@ -616,16 +634,17 @@ export const sessionIntel = (sessionID, what = null) => readSessionIntel(session
  * @param {string} id Reply id echoed from the push body.
  * @param {string} sessionID Session to inspect.
  * @param {string[]|null} what Intel keys to fetch (default all).
+ * @param {string} [prefix] Owning plugin letter for the reply line.
  */
-async function replySessionIntel(id, sessionID, what) {
+async function replySessionIntel(id, sessionID, what, prefix = "") {
     if (!activeClient) {
         log.error("session.intel: no active client (no plugin instance initialized the bridge)")
-        pool.reply(id, false, { error: { code: "no_client", message: "no plugin instance initialized the bridge" } })
+        pool.reply(id, false, { error: { code: "no_client", message: "no plugin instance initialized the bridge" } }, prefix)
         return
     }
     const intel = await readSessionIntel(sessionID, what)
     log.debug(`session.intel: replied session=${sessionID.slice(0, 8)} keys=[${Object.keys(intel).join(",") || "none"}]`)
-    pool.reply(id, true, { sessionID, ...intel })
+    pool.reply(id, true, { sessionID, ...intel }, prefix)
 }
 
 /**
@@ -637,12 +656,13 @@ async function replySessionIntel(id, sessionID, what) {
  * @param {string} sessionID Session to summarize.
  * @param {{ providerID?: string, modelID?: string }|null} [model] Optional
  *   summarizer model override (defaults to opencode's choice).
+ * @param {string} [prefix] Owning plugin letter for the reply line.
  */
-async function summarizeSession(id, sessionID, model) {
+async function summarizeSession(id, sessionID, model, prefix = "") {
     const client = activeClient
     if (!client) {
         log.error("session.summarize: no active client (no plugin instance initialized the bridge)")
-        pool.reply(id, false, { error: { code: "no_client", message: "no plugin instance initialized the bridge" } })
+        pool.reply(id, false, { error: { code: "no_client", message: "no plugin instance initialized the bridge" } }, prefix)
         return
     }
     try {
@@ -652,14 +672,14 @@ async function summarizeSession(id, sessionID, model) {
         })
         if (res?.error) {
             log.error(`session.summarize: client error session=${sessionID.slice(0, 8)}: ${res.error.message ?? String(res.error)}`)
-            pool.reply(id, false, { error: { code: "client_error", message: res.error.message ?? String(res.error), sessionID } })
+            pool.reply(id, false, { error: { code: "client_error", message: res.error.message ?? String(res.error), sessionID } }, prefix)
             return
         }
         log.debug(`session.summarize: kicked off session=${sessionID.slice(0, 8)}`)
-        pool.reply(id, true, { sessionID, started: true })
+        pool.reply(id, true, { sessionID, started: true }, prefix)
     } catch (err) {
         log.error(`session.summarize: exception session=${sessionID.slice(0, 8)}: ${err.message}`)
-        pool.reply(id, false, { error: { code: "client_error", message: err.message, sessionID } })
+        pool.reply(id, false, { error: { code: "client_error", message: err.message, sessionID } }, prefix)
     }
 }
 
@@ -671,24 +691,24 @@ async function summarizeSession(id, sessionID, model) {
  * own permission handler resolves the pending ask. `response` follows the
  * SDK semantics: "once" / "always" / "reject".
  */
-async function answerPermission(id, body) {
+async function answerPermission(id, body, prefix = "") {
     const response = body.response
     if (response !== "once" && response !== "always" && response !== "reject") {
         log.error(`permission.answer: invalid response=${response}, ignored`)
         pool.reply(id, false, {
             error: { code: "invalid_request", message: `response must be once|always|reject, got ${response}` },
-        })
+        }, prefix)
         return
     }
     const permissionID = typeof body.permissionID === "string" ? body.permissionID : ""
     if (!permissionID) {
         log.error("permission.answer: missing permissionID, ignored")
-        pool.reply(id, false, { error: { code: "invalid_request", message: "missing permissionID" } })
+        pool.reply(id, false, { error: { code: "invalid_request", message: "missing permissionID" } }, prefix)
         return
     }
     if (!activeClient?.postSessionIdPermissionsPermissionId) {
         log.error("permission.answer: no active client (no plugin instance initialized the bridge)")
-        pool.reply(id, false, { error: { code: "no_client", message: "no plugin instance initialized the bridge" } })
+        pool.reply(id, false, { error: { code: "no_client", message: "no plugin instance initialized the bridge" } }, prefix)
         return
     }
     const sessionID = typeof body.sessionID === "string" ? body.sessionID : ""
@@ -700,15 +720,29 @@ async function answerPermission(id, body) {
         })
         if (res?.error) {
             log.error(`permission.answer: client_error ${res.error.message ?? String(res.error)}`)
-            pool.reply(id, false, { error: { code: "client_error", message: res.error.message ?? String(res.error) } })
+            pool.reply(id, false, { error: { code: "client_error", message: res.error.message ?? String(res.error) } }, prefix)
             return
         }
         log.debug(`permission.answer: responded ${response} to permissionID=${permissionID.slice(0, 8)}`)
-        pool.reply(id, true, { permissionID, response })
+        pool.reply(id, true, { permissionID, response }, prefix)
     } catch (err) {
         log.error(`permission.answer: exception ${err.message}`)
-        pool.reply(id, false, { error: { code: "client_error", message: err.message } })
+        pool.reply(id, false, { error: { code: "client_error", message: err.message } }, prefix)
     }
+}
+
+/**
+ * Owning plugin letter for reverse-RPC reply channels. The reply line written
+ * by `pool.reply()` is JS→Python traffic, so it carries the plugin prefix of
+ * the channel's owner: context reads/intel/summarize → plugin-context (`c`),
+ * task launch → plugin-task (`t`), permission answer → plugin-permission (`p`).
+ */
+const REPLY_PREFIX = {
+    "session.context.read": PLUGIN_PREFIX.context,
+    "session.intel": PLUGIN_PREFIX.context,
+    "session.summarize": PLUGIN_PREFIX.context,
+    "task.launch": PLUGIN_PREFIX.task,
+    "permission.answer": PLUGIN_PREFIX.permission,
 }
 
 /**
@@ -731,7 +765,7 @@ function handlePush(channel, body) {
     }
     if (channel === "session.context.read" && body && typeof body === "object") {
         if (typeof body.id === "string" && typeof body.sessionID === "string") {
-            void readSessionContext(body.id, body.sessionID)
+            void readSessionContext(body.id, body.sessionID, REPLY_PREFIX[channel])
         } else {
             log.error("session.context.read: missing id/sessionID, ignored")
         }
@@ -739,7 +773,7 @@ function handlePush(channel, body) {
     }
     if (channel === "task.launch" && body && typeof body === "object") {
         if (typeof body.id === "string") {
-            void launchTask(body.id, body)
+            void launchTask(body.id, body, REPLY_PREFIX[channel])
         } else {
             log.error("task.launch: missing id, ignored")
         }
@@ -747,7 +781,7 @@ function handlePush(channel, body) {
     }
     if (channel === "session.intel" && body && typeof body === "object") {
         if (typeof body.id === "string" && typeof body.sessionID === "string") {
-            void replySessionIntel(body.id, body.sessionID, body.what)
+            void replySessionIntel(body.id, body.sessionID, body.what, REPLY_PREFIX[channel])
         } else {
             log.error("session.intel: missing id/sessionID, ignored")
         }
@@ -755,7 +789,7 @@ function handlePush(channel, body) {
     }
     if (channel === "session.summarize" && body && typeof body === "object") {
         if (typeof body.id === "string" && typeof body.sessionID === "string") {
-            void summarizeSession(body.id, body.sessionID, body.model ?? null)
+            void summarizeSession(body.id, body.sessionID, body.model ?? null, REPLY_PREFIX[channel])
         } else {
             log.error("session.summarize: missing id/sessionID, ignored")
         }
@@ -763,7 +797,7 @@ function handlePush(channel, body) {
     }
     if (channel === "permission.answer" && body && typeof body === "object") {
         if (typeof body.id === "string") {
-            void answerPermission(body.id, body)
+            void answerPermission(body.id, body, REPLY_PREFIX[channel])
         } else {
             log.error("permission.answer: missing id, ignored")
         }
@@ -1043,15 +1077,16 @@ class SocketPool {
      * no socket is writable the line is dropped (these ops are informational).
      * @param {string} op
      * @param {object} body
+     * @param {string} [prefix] Owning plugin letter (`h`/`t`/`p`/`c`/`e`/`s`).
      */
-    send(op, body) {
+    send(op, body, prefix = "") {
         if (this.#closed) {
             log.debug(`pool: send dropped op=${op} (bridge closed)`)
             return
         }
         this.#ensureConnected()
         const id = randomUUID()
-        const line = JSON.stringify({ id, op, body }) + "\n"
+        const line = `${prefix ? `${prefix}:` : ""}${JSON.stringify({ id, op, body })}\n`
         if (this.#socket && !this.#socket.destroyed && this.#socket.writable) {
             this.#socket.write(line)
             log.debug(`pool: sent (no-reply) op=${op} id=${id.slice(0, 8)}`)
@@ -1070,13 +1105,14 @@ class SocketPool {
      * @param {string} id
      * @param {boolean} ok
      * @param {Record<string, any>} payload Extra fields merged into the line.
+     * @param {string} [prefix] Owning plugin letter for the reply channel.
      */
-    reply(id, ok, payload = {}) {
+    reply(id, ok, payload = {}, prefix = "") {
         if (this.#closed) {
             log.debug(`pool: reply dropped id=${id.slice(0, 8)} ok=${ok} (bridge closed)`)
             return
         }
-        const line = JSON.stringify({ id, ok, ...payload }) + "\n"
+        const line = `${prefix ? `${prefix}:` : ""}${JSON.stringify({ id, ok, ...payload })}\n`
         if (this.#socket && !this.#socket.destroyed && this.#socket.writable) {
             this.#socket.write(line)
             log.debug(`pool: replied id=${id.slice(0, 8)} ok=${ok}`)
@@ -1096,9 +1132,10 @@ class SocketPool {
      * @param {string} op
      * @param {object} body
      * @param {number} timeoutMs
+     * @param {string} [prefix] Owning plugin letter (`h`/`t`/`p`/`c`/`e`/`s`).
      * @returns {Promise<Record<string, any>|null>}
      */
-    rpc(op, body, timeoutMs) {
+    rpc(op, body, timeoutMs, prefix = "") {
         if (this.#closed) {
             log.debug(`pool: rpc rejected op=${op} (bridge closed)`)
             return Promise.resolve(null)
@@ -1114,7 +1151,7 @@ class SocketPool {
         this.#ensureConnected()
 
         const id = randomUUID()
-        const line = JSON.stringify({ id, op, body }) + "\n"
+        const line = `${prefix ? `${prefix}:` : ""}${JSON.stringify({ id, op, body })}\n`
 
         return new Promise((resolve) => {
             // ONE deadline timer covers the whole lifetime, including any
@@ -1202,28 +1239,28 @@ let _shortIdCounter = 0
  * @param {string} op
  * @param {object} body
  * @param {number} timeoutMs
- * @param {{ wait?: boolean }} opts
+ * @param {{ wait?: boolean, prefix?: string }} opts
  * @returns {Promise<Record<string, any>|null>}
  */
-export function rpc(op, body, timeoutMs, { wait = true } = {}) {
+export function rpc(op, body, timeoutMs, { wait = true, prefix = "" } = {}) {
     const shortId = String(++_shortIdCounter).padStart(8, "0")
-    log.debug(`rpc[${shortId}] → op=${op} timeout=${timeoutMs}ms wait=${wait}`)
+    log.debug(`rpc[${shortId}] → op=${op} timeout=${timeoutMs}ms wait=${wait}${prefix ? ` prefix=${prefix}` : ""}`)
 
     if (NO_REPLY_OPS.has(op)) {
         // Server NEVER replies to this op — write-only, no pending entry,
         // no orphan timeout log, no wait.
-        pool.send(op, body)
+        pool.send(op, body, prefix)
         return Promise.resolve({})
     }
 
     if (!wait) {
         // Reply expected but the caller doesn't need it: register with a
         // short deadline so the reply can still be matched and resolved.
-        pool.rpc(op, body, Math.min(timeoutMs, SHORT_TIMEOUT_MS)).catch(() => {})
+        pool.rpc(op, body, Math.min(timeoutMs, SHORT_TIMEOUT_MS), prefix).catch(() => {})
         return Promise.resolve({})
     }
 
-    return pool.rpc(op, body, timeoutMs)
+    return pool.rpc(op, body, timeoutMs, prefix)
 }
 
 // ── event debouncer ───────────────────────────────────────────────────
@@ -1239,11 +1276,13 @@ class EventDebouncer {
     #timers = new Map()
 
     /**
-     * Queue an event for debounced sending.
+     * Queue an event for debounced sending. Batches are keyed per prefix so
+     * events from different plugins never coalesce into one prefixed line.
      * @param {{ type: string, properties: object, directory: string, worktree: string }} event
+     * @param {string} [prefix] Owning plugin letter (`h`/`t`/`p`/`c`/`e`/`s`).
      */
-    push(event) {
-        const key = "default"
+    push(event, prefix = "") {
+        const key = prefix || "default"
         if (!this.#batches.has(key)) {
             this.#batches.set(key, [])
         }
@@ -1277,14 +1316,17 @@ class EventDebouncer {
         }
         this.#batches.delete(key)
 
+        // The batch key IS the owning plugin prefix ("default" = none).
+        const prefix = key === "default" ? "" : key
+
         if (batch.length === 1) {
             // Single event — send directly
-            log.debug(`debounce: flush 1 event: ${batch[0].type}`)
-            void rpc("event", batch[0], SHORT_TIMEOUT_MS, { wait: false })
+            log.debug(`debounce: flush 1 event: ${batch[0].type}${prefix ? ` prefix=${prefix}` : ""}`)
+            void rpc("event", batch[0], SHORT_TIMEOUT_MS, { wait: false, prefix })
         } else {
             // Batched — send as batch event
-            log.debug(`debounce: flush ${batch.length} events: ${batch.map(e => e.type).join(",")}`)
-            void rpc("event", { type: "event.batch", events: batch }, SHORT_TIMEOUT_MS, { wait: false })
+            log.debug(`debounce: flush ${batch.length} events: ${batch.map(e => e.type).join(",")}${prefix ? ` prefix=${prefix}` : ""}`)
+            void rpc("event", { type: "event.batch", events: batch }, SHORT_TIMEOUT_MS, { wait: false, prefix })
         }
     }
 
@@ -1299,7 +1341,7 @@ class EventDebouncer {
 const debouncer = new EventDebouncer()
 
 /** Queue a fire-and-forget event for debounced delivery to Python. */
-export const pushEvent = (event) => debouncer.push(event)
+export const pushEvent = (event, prefix = "") => debouncer.push(event, prefix)
 
 /** Test/introspection helper: current pool state (pending rpc count etc.). */
 export const poolStats = () => pool.stats()

@@ -185,6 +185,16 @@ v0.4 NDJSON over a Unix socket, `\n`-delimited, UTF-8.
 - Response Py→JS: `{id, ok, ...payload}` or `{id, ok:false, error:{code, message}}`
 - Push Py→JS: `{type: "push", channel, body}` — never replied to, no `id`
 
+Every JS→Py line MAY carry the owning plugin's letter prefix before the JSON
+(`h:` hooks, `t:` task, `p:` permission, `c:` context, `e:` events; secrets
+never talks to Python) — the server strips `^[ecpths]:` before decoding.
+Py→JS lines are always plain JSON. See
+[`PLUGINS.md`](PLUGINS.md) for the wire-prefix table and the full
+**response reference** — every reply payload, type, and error code for the
+hook RPCs (`bootstrap`/`config`/`pre`/`permission`/`post`/`shell-env`/
+`context`/`event.pipeline`) and the reverse-RPCs (`session.context.read`,
+`session.intel`, `session.summarize`, `task.launch`, `permission.answer`).
+
 Ops: `bootstrap`, `config`, `pre`, `permission`, `post`, `shell-env`, `context`,
 `event.pipeline`, `event`. `scripts/client.py` is the reference implementation.
 

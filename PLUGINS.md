@@ -17,6 +17,33 @@ functionally identical.
 
 ---
 
+## Wire protocol — per-plugin prefixes
+
+Every JS→Py line on the socket MAY carry the owning plugin's letter followed by
+a `:` before the JSON payload; the Python brain strips it before decoding.
+Py→JS lines (bootstrap/config replies, `capabilities.update` pushes, reverse-RPC
+replies) are always plain JSON — the prefix exists so the *server* knows which
+plugin a hook line came from, which it cannot tell from the JSON alone.
+
+| letter | plugin | emits |
+|--------|--------|-------|
+| `h:` | plugin-hooks | `pre`, `post`, `shell-env`, its own `event` lines |
+| `t:` | plugin-task | `pre` (task gate), its own `event` lines |
+| `p:` | plugin-permission | `permission`, its own `event` lines |
+| `c:` | plugin-context | `context` (compacting + context syncs) |
+| `e:` | plugin-events | `event.pipeline`, fire-and-forget `event` |
+| `s:` | plugin-secrets | **never** — the hardblock is local-only, no socket bytes |
+
+Bridge-level ops (`bootstrap`, `config`) and every Py→JS line are unprefixed.
+
+**Reverse-RPC replies carry the prefix too** (`REPLY_PREFIX` in transport.js):
+`session.context.read`, `session.intel`, `session.summarize` reply with `c:`;
+`task.launch` replies with `t:`; `permission.answer` replies with `p:`. A Python
+brain that routes replies back by `id` only needs to strip `^[ecpths]:` from
+every line it reads (reference: `scripts/client.py` `strip_plugin_prefix`).
+
+---
+
 ## plugin-secrets.js — `.env` hardblock (LOCAL invariant)
 
 The one deliberate exception to "Python owns all decisions": secret files are
@@ -111,7 +138,7 @@ pending prompt with a later programmatic settlement:
 ```json
 { "type": "push", "channel": "permission.answer", "body": {
   "id": "…", "permissionID": "…", "sessionID": "…",
-  "response": "once" | "always" | "reject", "directory": "…" } }
+  "response": "once|always|reject", "directory": "…" } }
 ```
 
 transport.js calls `client.postSessionIdPermissionsPermissionId` (the same
@@ -254,8 +281,10 @@ while sharing one transport. Behavior is identical to the per-file entries.
 | export | purpose |
 |--------|---------|
 | `startBridge(input)` | init from a plugin instance (idempotent; sets client, dir, worktree, project; kicks bootstrap) |
-| `rpc(op, body, timeoutMs, {wait})` | request/reply RPC through the pool |
-| `pushEvent(event)` | debounced fire-and-forget event |
+| `rpc(op, body, timeoutMs, {wait, prefix})` | request/reply RPC through the pool (`prefix` = wire letter `h/t/p/c/e`) |
+| `pushEvent(event, prefix)` | debounced fire-and-forget event (batch keyed per prefix) |
+| `PLUGIN_PREFIX` | `{hooks:"h", task:"t", permission:"p", context:"c", events:"e", secrets:"s"}` |
+| `REPLY_PREFIX` | reverse-RPC reply letters: `session.context.read`/`session.intel`/`session.summarize` → `c`, `task.launch` → `t`, `permission.answer` → `p` |
 | `okReply(msg)` | normalize a reply (`{ok:true}` only) |
 | `gateBlocking(capKey)` | gate a blocking op → `rpc`/`skip`/`inert`/`failed` |
 | `gateNonBlocking(capKey)` | gate a non-blocking op → boolean |
@@ -274,6 +303,58 @@ re-apply + config), `session.inject` (live content injection via
 `session.summarize` (reverse-RPCs above), `permission.answer` (reverse-RPC
 above). `permissions.update` is informational — permission rules live in the
 Python brain, there is nothing to cache JS-side.
+
+---
+
+## Response reference — every reply payload and type
+
+All socket replies share one envelope (see the prefix note above: reverse-RPC
+replies additionally carry `c:`/`t:`/`p:`):
+
+- OK: `{id: string, ok: true, ...payload}`
+- Error: `{id: string, ok: false, error: {code: string, message: string, sessionID?: string}}`
+
+### Hook RPC replies (Py→JS, server → plugin)
+
+| op | `ok:true` payload | types | error handling |
+|----|-------------------|-------|----------------|
+| `bootstrap` | `{capabilities: {pre, post, shellEnv, context, eventPipeline: boolean}}` | booleans | handshake failure → inert (never-connected) or fail-closed (lost brain) |
+| `config` | `{config?: object}` | arbitrary config deltas | fail-open at load; deltas applied to the mutable runtime config |
+| `pre` | `{}` proceed · `{allow: false, reason: string}` block · `{args: object}` mutate | `reason` string, `args` merged over originals | error reply → hook throws (tool blocked); lost brain → throws |
+| `permission` | `{status: "allow" \| "ask" \| "deny"}` (v0.4) · `{allow: boolean}` (back-compat) | string enum / boolean | error reply → `deny` (fail-closed); lost brain → `deny` |
+| `post` | `{title?: string, output?: string, metadata?: object}` | merged into output fields | non-blocking, errors swallowed |
+| `shell-env` | `{env: {[key: string]: string}}` | merged into `output.env` | non-blocking, errors swallowed |
+| `context` | `{}` default · `{prompt: string}` replace · `{context: string \| object[]}` inject | compaction decision | non-blocking, default used on error |
+| `event.pipeline` | `{}` informational | — | host never awaits; errors swallowed |
+| `event` | **no reply** (fire-and-forget) | — | server must not reply to NO_REPLY ops |
+
+### Reverse-RPC replies (JS→Py, prefixed `c:`/`t:`/`p:`)
+
+| channel | `ok:true` payload | types | error codes |
+|---------|-------------------|-------|-------------|
+| `session.context.read` | `{session: Session, messages: Message[]}` | SDK `Session`, `Message[]` | `no_client`, `client_error` |
+| `task.launch` | `{sessionID: string, info: AssistantMessage, parts: Part[], text: string}` | `text` = last text part | `no_client`, `invalid_request`, `client_error`, `timeout` |
+| `session.intel` | `{sessionID: string, stats?, recent?, diff?, todo?}` | per-`what` filter | `no_client` |
+| `session.summarize` | `{sessionID: string, started: true}` | boolean `started` | `no_client`, `client_error` |
+| `permission.answer` | `{permissionID: string, response: "once" \| "always" \| "reject"}` | echo of the push body | `invalid_request`, `no_client`, `client_error` |
+
+### `session.intel` payload types
+
+| field | type | meaning |
+|-------|------|---------|
+| `stats` | `{total: number, byRole: {[role: string]: number}, lastUpdated: string}` | message count / role split / last activity |
+| `recent` | `string` | last 20 text parts, trimmed, joined, capped at 12k chars |
+| `diff` | `FileDiff[]` — `{file: string, before: string, after: string, additions: number, deletions: number}` | working-tree diff |
+| `todo` | `Todo[]` — `{id: string, content: string, status: string, priority: string}` | opencode todo list |
+
+### Error codes (reverse-RPC)
+
+| code | when |
+|------|------|
+| `no_client` | bridge not initialized or no active SDK client — nothing to act on |
+| `invalid_request` | malformed push body (e.g. `task.launch` without a non-empty `prompt`, `permission.answer` missing `permissionID` or with an unknown `response`) |
+| `client_error` | an SDK call failed; `sessionID` included when the session was created/known |
+| `timeout` | `task.launch` exceeded `timeoutMs`; `sessionID` included, session aborted best-effort, first reply wins |
 
 ## Testing
 
@@ -311,3 +392,8 @@ uv run --group test pytest   # scripts/client.py smoke tests
 - `tests/plugins.session.test.mjs` — `session.intel` reads (stats/recent/
   diff/todo, `what` filter, per-item fail-safe), `session.summarize`
   kick-off + model override, and the compaction-handshake `context` RPC body.
+- `tests/plugins.prefix.test.mjs` — raw-line wire assertions: every plugin
+  emits its owning letter prefix (`h`/`t`/`p`/`c`/`e`), `bootstrap`/`config`
+  stay unprefixed, and reverse-RPC replies carry `c:`/`t:`/`p:`.
+- `tests/test_client.py` — `strip_plugin_prefix` unit tests (serve/stream
+  decode paths in `scripts/client.py`).

@@ -21,6 +21,7 @@ import {
     timeouts,
     warnInert,
     FAIL_OPEN,
+    PLUGIN_PREFIX,
     debugEnabled,
 } from "./transport.js"
 
@@ -44,7 +45,7 @@ export const server = async ({ client, directory: dir, worktree: wt, project: pr
                 properties: { tool: input.tool, callID: input.callID },
                 directory: directory() ?? dir,
                 worktree: worktree() ?? wt,
-            })
+            }, PLUGIN_PREFIX.hooks)
 
             const gate = await gateBlocking("pre")
             if (gate.kind === "skip") {
@@ -82,6 +83,7 @@ export const server = async ({ client, directory: dir, worktree: wt, project: pr
                     directory: directory() ?? dir,
                 },
                 timeouts.pre,
+                { prefix: PLUGIN_PREFIX.hooks },
             ))
 
             if (!decision) {
@@ -119,7 +121,7 @@ export const server = async ({ client, directory: dir, worktree: wt, project: pr
                 properties: { tool: input.tool, callID: input.callID },
                 directory: directory() ?? dir,
                 worktree: worktree() ?? wt,
-            })
+            }, PLUGIN_PREFIX.hooks)
 
             if (!gateNonBlocking("post")) {
                 // Brain has no post capability → leave output unchanged.
@@ -140,6 +142,7 @@ export const server = async ({ client, directory: dir, worktree: wt, project: pr
                     directory: directory() ?? dir,
                 },
                 timeouts.post,
+                { prefix: PLUGIN_PREFIX.hooks },
             ))
 
             if (!decision) {
@@ -171,7 +174,7 @@ export const server = async ({ client, directory: dir, worktree: wt, project: pr
                 properties: { cwd: input.cwd },
                 directory: directory() ?? dir,
                 worktree: worktree() ?? wt,
-            })
+            }, PLUGIN_PREFIX.hooks)
 
             if (!gateNonBlocking("shellEnv")) {
                 // Brain has no shell-env capability → env unchanged.
@@ -188,6 +191,7 @@ export const server = async ({ client, directory: dir, worktree: wt, project: pr
                     directory: directory() ?? dir,
                 },
                 timeouts.short,
+                { prefix: PLUGIN_PREFIX.hooks },
             ))
 
             if (!reply) {
