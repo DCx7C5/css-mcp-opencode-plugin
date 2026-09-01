@@ -110,6 +110,34 @@ test("secrets: blocks .env through paths/vars — no boundary bypass", async () 
     assert.equal(okUrl.args.command, "curl https://api.example.com/v1/env")
 })
 
+test("secrets: tool-agnostic guard covers unknown/MCP tools fail-closed", async () => {
+    const hooks = await load("plugins/plugin-secrets.js")
+    const reject = (tool, args) =>
+        assert.rejects(() => hooks["tool.execute.before"]({ tool }, { args }), /hardblock/)
+    const allow = async (tool, args) => {
+        const out = { args }
+        await hooks["tool.execute.before"]({ tool }, out)
+        assert.equal(out.args, args)
+    }
+
+    // Unknown / MCP / custom tools with secret paths or tokens → reject.
+    await reject("mcp__py-bridge__read_file", { path: "/proj/.env" })
+    await reject("mcp__server__read_file", { path: "/proj/.env" })
+    await reject("mcp__server__glob", { pattern: ".env*" })
+    await reject("custom_tool", { filePath: ".env.local" })
+    await reject("mcp__shell__run", { command: "cat /proj/.env" })
+    await reject("mcp__server__op", { options: { target: "/proj/.env" } })
+    await reject("mcp__server__op", { files: ["/a/.env", "x.py"] })
+
+    // .env.example stays fully allowed for unknown tools.
+    await allow("mcp__server__read_file", { path: ".env.example" })
+    await allow("mcp__server__op", { options: { target: "/proj/.env.example" } })
+    await allow("mcp__shell__run", { command: "cat .env.example" })
+
+    // Allowlisted `task` is exempt (generic scan skipped).
+    await allow("task", { description: "read .env vars" })
+})
+
 test("secrets: permission.ask denies secret patterns, leaves others ask", async () => {
     const hooks = await load("plugins/plugin-secrets.js")
     const denied = { status: "ask" }

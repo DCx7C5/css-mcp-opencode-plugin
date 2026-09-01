@@ -17,6 +17,9 @@
  *    shared; the hardblock deliberately does not flag them.
  *  - Bash detection is token-based: a command containing a `.env` token
  *    (cat/less/curl/source …) is blocked rather than risk a leak.
+ *  - TOOL-AGNOSTIC: unknown / MCP / custom tools are scanned fail-closed —
+ *    every string leaf in args (depth ≤ 3) is tested as both a path and a
+ *    shell token. Only explicitly allowlisted tools (e.g. `task`) are exempt.
  */
 
 import { startBridge } from "./transport.js"
@@ -36,6 +39,8 @@ const BASH_SECRET_TOKEN_RE = /(^|[/\s"'=&|;()])\.env(?!\.example)(?:[A-Za-z0-9_.
 const FILE_PATH_TOOLS = new Set(["read", "edit", "write", "glob", "grep", "list"])
 /** Bash may touch the filesystem through a shell command. */
 const BASH_TOOLS = new Set(["bash"])
+/** Tools explicitly exempt from the generic scan (handled elsewhere). */
+const ALLOWED_UNKNOWN_TOOLS = new Set(["task"])
 
 /** Normalize a path-ish value: expand leading ~, strip quotes. */
 const normalizePath = (value) => {
@@ -72,6 +77,16 @@ const candidateValues = (args) => {
     return out
 }
 
+/** Collect every string leaf from a value tree (depth-limited). */
+const collectStrings = (node, depth = 0, out = [], maxDepth = 3) => {
+    if (depth > maxDepth) return out
+    if (typeof node === "string") { out.push(node); return out }
+    if (node && typeof node === "object") {
+        for (const v of Object.values(node)) collectStrings(v, depth + 1, out, maxDepth)
+    }
+    return out
+}
+
 export const server = async ({ client, directory, worktree, project }) => {
     startBridge({ client, directory, worktree, project })
 
@@ -91,13 +106,31 @@ export const server = async ({ client, directory, worktree, project }) => {
                 }
                 return
             }
-            if (BASH_TOOLS.has(tool) && hasSecretToken(output.args?.command)) {
-                console.error(
-                    `[python-bridge] [error] secrets: BLOCKED bash referencing .env (hardblock)`,
-                )
-                throw new Error(
-                    "Refusing bash command that references a .env secret file (hardblock).",
-                )
+            if (BASH_TOOLS.has(tool)) {
+                if (hasSecretToken(output.args?.command)) {
+                    console.error(
+                        `[python-bridge] [error] secrets: BLOCKED bash referencing .env (hardblock)`,
+                    )
+                    throw new Error(
+                        "Refusing bash command that references a .env secret file (hardblock).",
+                    )
+                }
+                return
+            }
+            // Tool-agnostic fallback: unknown/MCP/custom tools are scanned
+            // fail-closed. Every string leaf is treated as both a path and a
+            // shell token; allowlisted tools (e.g. task) are exempt.
+            if (!ALLOWED_UNKNOWN_TOOLS.has(tool)) {
+                for (const s of collectStrings(output.args)) {
+                    if (isSecretPath(s) || hasSecretToken(s)) {
+                        console.error(
+                            `[python-bridge] [error] secrets: BLOCKED ${tool} (hardblock)`,
+                        )
+                        throw new Error(
+                            `Refusing to ${tool}: secret files (.env*) are hardblocked.`,
+                        )
+                    }
+                }
             }
         },
 
