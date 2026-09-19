@@ -122,3 +122,15 @@ export const server = async ({ client: c, directory: dir, worktree: wt, project:
         },
     }
 }
+
+// ── opencode v2 contract ────────────────────────────────────────────────
+// v2 loads plugins from a DEFAULT export: an object `{ id, setup(ctx) }`
+// that registers hooks through the plugin context. The v1 `server` export
+// above is retained for the legacy loader and npm test; the default
+// definition re-registers the same hook map through the v2 domain APIs
+// (see opencode-v2.js for the event adapters).
+import { definePlugin, bridgeHooksV2 } from "./opencode-v2.js"
+
+export default definePlugin("css-mcp-opencode-plugin/permission", (ctx) =>
+    bridgeHooksV2(ctx, [server]),
+)
