@@ -270,9 +270,11 @@ Tracked event list lives in `transport.js` (`TRACKED_EVENTS` +
 
 ## plugins/index.js — aggregator (npm/GitHub default)
 
-`package.json` `main`. opencode's legacy loader treats every `server`-shaped
-export as a separate plugin, so pointing opencode at this file registers all six
-while sharing one transport. Behavior is identical to the per-file entries.
+`package.json` `main`. The default export is a single opencode v2 plugin
+definition (`{ id: "css-mcp-opencode-plugin", setup(ctx) }`) that registers all
+six concerns through `opencode-v2.js` (v1-hook → v2-domain-hook adapter) while
+sharing one transport. The named `server` re-exports are kept for opencode 1.x
+and direct imports. Behavior is identical to the per-file entries.
 
 ---
 

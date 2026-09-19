@@ -82,18 +82,20 @@ that always holds, even with no brain.
 npm install css-mcp-opencode-plugin
 ```
 
-Loads the aggregator `plugins/index.js` (all six plugins, one entry).
+Loads the aggregator `plugins/index.js` (all six plugins, one entry; its
+default export is a single opencode v2 plugin definition that registers every
+concern through the shared transport).
 
 ### GitHub URL
 
 ```
-"plugin": ["github:DCx7C5/css-mcp-opencode-plugin"]
+"plugins": ["github:DCx7C5/css-mcp-opencode-plugin"]
 ```
 
-> GitHub URL plugin loading is verified on opencode ≥ 1.18.4: `opencode plugin
-> github:DCx7C5/css-mcp-opencode-plugin` installs the repo, detects the `server`
-> target, and updates the project config. npm publish remains the alternative
-> for versioned distribution.
+> GitHub URL plugin loading is verified on opencode 2.x: `opencode plugin
+> github:DCx7C5/css-mcp-opencode-plugin` installs the repo and loads the v2
+> default-export definition (`{ id, setup(ctx) }`). npm publish remains the
+> alternative for versioned distribution.
 
 ### Split into plugins (one repo → many plugins)
 
@@ -104,7 +106,7 @@ entry to the exact file (not the package `main`):
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": [
+  "plugins": [
     "../plugins/plugin-secrets.js",
     "../plugins/plugin-hooks.js",
     "../plugins/plugin-task.js",
@@ -117,8 +119,9 @@ entry to the exact file (not the package `main`):
 
 Order matters: `plugin-secrets.js` first so the local hardblock runs before the
 Python gate. To load all of them from a single entry instead, point at
-`plugins/index.js` (opencode loads every `server`-shaped export as a separate
-plugin) — this is also the npm/GitHub default.
+`plugins/index.js` — its v2 default definition registers all six concerns —
+this is also the npm/GitHub default. (Every plugin also keeps its v1 named
+`server` export; opencode 1.x loads the per-file entries the legacy way.)
 
 > ⚠️ Load **either** the per-file entries **or** the aggregator
 > (`plugins/index.js`) — never both. Each hook would register twice, so every
@@ -126,24 +129,24 @@ plugin) — this is also the npm/GitHub default.
 
 ### opencode.json entries — every load form
 
-Plugins are declared in the `"plugin"` array. Put it in the **project**
+Plugins are declared in the `"plugins"` array (opencode 1.x used `"plugin"` — the v2 config normalizes it). Put it in the **project**
 `.opencode/opencode.json`, or in the **global** `~/.config/opencode/opencode.json`
 to apply to every project.
 
 | form | entry | loads |
 |------|-------|-------|
-| npm package | `"plugin": ["css-mcp-opencode-plugin"]` | all six via `main` (`plugins/index.js`) |
-| GitHub URL | `"plugin": ["github:DCx7C5/css-mcp-opencode-plugin"]` | all six via `main` |
-| local per-file | `"plugin": ["../plugins/plugin-secrets.js", …]` | exactly the listed plugins (project-local dev) |
-| local aggregator | `"plugin": ["../plugins/index.js"]` | all six, one entry |
-| single plugin | `"plugin": ["../plugins/plugin-secrets.js"]` | one plugin only |
+| npm package | `"plugins": ["css-mcp-opencode-plugin"]` | all six via `main` (`plugins/index.js`) |
+| GitHub URL | `"plugins": ["github:DCx7C5/css-mcp-opencode-plugin"]` | all six via `main` |
+| local per-file | `"plugins": ["../plugins/plugin-secrets.js", …]` | exactly the listed plugins (project-local dev) |
+| local aggregator | `"plugins": ["../plugins/index.js"]` | all six, one entry |
+| single plugin | `"plugins": ["../plugins/plugin-secrets.js"]` | one plugin only |
 
 Example — project `.opencode/opencode.json`, all six from this repo:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": [
+  "plugins": [
     "../plugins/plugin-secrets.js",
     "../plugins/plugin-hooks.js",
     "../plugins/plugin-task.js",
