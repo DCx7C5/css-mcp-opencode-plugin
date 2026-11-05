@@ -1,11 +1,375 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
-    "../plugins/plugin-secrets.js",
-    "../plugins/plugin-hooks.js",
-    "../plugins/plugin-task.js",
-    "../plugins/plugin-permission.js",
-    "../plugins/plugin-context.js",
-    "../plugins/plugin-events.js"
-  ]
+    "github:DCx7C5/css-mcp-opencode-plugin"
+  ],
+  "model": "opencode/deepseek-v4.1-flash-free#max",
+  "snapshots": false,
+  "shell": "fish",
+  "formatter": true,
+  "default_agent": "css-planner",
+  "experimental": {
+    "subagent_depth": 2,
+    "background_compaction": false,
+    "schedules": true,
+    "image_generate": true
+  },
+  "compaction": {
+    "auto": false,
+    "keep": { "tokens": 8000 }
+  },
+  "providers": {
+    "local": {
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "http://127.0.0.1:11434/v1"
+      },
+      "models": {
+        "moondream:latest-gpuonly": {
+          "name": "Moondream (vision, GPU)",
+          "capabilities": { "tools": false, "input": ["text", "image"], "output": ["text"] }
+        },
+        "qwen3-embedding:0.6b": {
+          "name": "Qwen3 Embedding 0.6B",
+          "disabled": true,
+          "capabilities": { "tools": false, "input": ["text"], "output": ["text"] }
+        },
+        "phi4-mini:latest": {
+          "name": "Phi-4 Mini",
+          "disabled": true,
+          "capabilities": { "tools": true, "input": ["text"], "output": ["text"] }
+        },
+        "gemma3:1b-cpuonly": {
+          "name": "Gemma 3 1B (CPU)",
+          "capabilities": { "tools": false, "input": ["text", "image"], "output": ["text"] }
+        },
+        "gemma3:1b-gpuonly": {
+          "name": "Gemma 3 1B (GPU)",
+          "capabilities": { "tools": false, "input": ["text", "image"], "output": ["text"] }
+        },
+        "qwen3:0.6b-gpuonly": {
+          "name": "Qwen3 0.6B (GPU)",
+          "capabilities": { "tools": true, "input": ["text"], "output": ["text"] },
+          "limit": { "context": 16384, "output": 1024 },
+          "body": { "think": false }
+        },
+        "qwen3:0.6b-cpuonly": {
+          "name": "Qwen3 0.6B (CPU)",
+          "capabilities": { "tools": true, "input": ["text"], "output": ["text"] },
+          "limit": { "context": 16384, "output": 1024 },
+          "body": { "think": false }
+        },
+        "qwen2.5-coder:3b": {
+          "name": "Qwen2.5 Coder 3B",
+          "capabilities": { "tools": false, "input": ["text"], "output": ["text"] }
+        }
+      }
+    }
+  },
+  "mcp": {
+    "servers": {
+      "css": {
+        "type": "remote",
+        "url": "http://127.0.0.1:8000/mcp",
+        "disabled": false
+      }
+    }
+  },
+  "agents": {
+    "css-planner": {
+      "mode": "primary",
+      "permissions": [
+        { "action": "*", "resource": "*", "effect": "deny" },
+        { "action": "read", "resource": "*", "effect": "allow" },
+        { "action": "read", "resource": "*.env", "effect": "deny" },
+        { "action": "read", "resource": "*.env.*", "effect": "deny" },
+        { "action": "read", "resource": "*.env.example", "effect": "allow" },
+        { "action": "edit", "resource": "*", "effect": "allow" },
+        { "action": "grep", "resource": "*", "effect": "allow" },
+        { "action": "glob", "resource": "*", "effect": "allow" },
+        { "action": "webfetch", "resource": "*", "effect": "allow" },
+        { "action": "websearch", "resource": "*", "effect": "allow" },
+        { "action": "question", "resource": "*", "effect": "allow" },
+        { "action": "subagent", "resource": "css*", "effect": "allow" },
+        { "action": "subagent", "resource": "css-factory", "effect": "ask" },
+        { "action": "skill", "resource": "*", "effect": "allow" },
+        { "action": "shell", "resource": "uv run ruff check --fix*", "effect": "allow" },
+        { "action": "shell", "resource": "uv run ruff check --diff*", "effect": "allow" },
+        { "action": "shell", "resource": "*sqlite3*", "effect": "allow" },
+        { "action": "shell", "resource": "uv add *", "effect": "allow" },
+        { "action": "shell", "resource": "uv sync*", "effect": "allow" },
+        { "action": "shell", "resource": "uv run pytest*", "effect": "allow" },
+        { "action": "shell", "resource": "*", "effect": "allow" },
+        { "action": "css*", "resource": "*", "effect": "ask" },
+        { "action": "css*ide_*", "resource": "*", "effect": "allow" },
+        { "action": "css*ide_apply_patch", "resource": "*", "effect": "deny" },
+        { "action": "css*ide_execute_terminal_command", "resource": "*", "effect": "ask" },
+        { "action": "css*git_*", "resource": "*", "effect": "allow" },
+        { "action": "css*todo_*", "resource": "*", "effect": "allow" },
+        { "action": "css*sqlite_query", "resource": "*", "effect": "allow" },
+        { "action": "css*session_quicksearch", "resource": "*", "effect": "allow" },
+        { "action": "css*history_lookup", "resource": "*", "effect": "allow" },
+        { "action": "external_directory", "resource": "/tmp/opencode/*", "effect": "allow" },
+        { "action": "external_directory", "resource": "$HOME/.local/share/opencode/*", "effect": "allow" },
+        { "action": "external_directory", "resource": "$HOME/Projects/css-mcp-opencode-plugin/*", "effect": "allow" },
+        { "action": "external_directory", "resource": "*", "effect": "ask" },
+        { "action": "shell", "resource": "git *", "effect": "deny" },
+        { "action": "edit", "resource": "**/opencode.jsonc", "effect": "deny" },
+        { "action": "edit", "resource": "**/opencode.json", "effect": "deny" },
+        { "action": "edit", "resource": "pyproject.toml", "effect": "deny" }
+      ]
+    },
+    "css-developer": {
+      "mode": "all",
+      "permissions": [
+        { "action": "*", "resource": "*", "effect": "deny" },
+        { "action": "read", "resource": "*", "effect": "allow" },
+        { "action": "read", "resource": "*.env", "effect": "deny" },
+        { "action": "read", "resource": "*.env.*", "effect": "deny" },
+        { "action": "read", "resource": "*.env.example", "effect": "allow" },
+        { "action": "glob", "resource": "*", "effect": "allow" },
+        { "action": "grep", "resource": "*", "effect": "allow" },
+        { "action": "edit", "resource": "**/*.py", "effect": "allow" },
+        { "action": "edit", "resource": "**/*.toml", "effect": "allow" },
+        { "action": "edit", "resource": "**/*.md", "effect": "allow" },
+        { "action": "edit", "resource": "**/*.sh", "effect": "allow" },
+        { "action": "edit", "resource": "**/*.rs", "effect": "allow" },
+        { "action": "shell", "resource": "uv run *", "effect": "allow" },
+        { "action": "shell", "resource": "uv add *", "effect": "allow" },
+        { "action": "shell", "resource": "uv sync*", "effect": "allow" },
+        { "action": "shell", "resource": "*", "effect": "allow" },
+        { "action": "question", "resource": "*", "effect": "ask" },
+        { "action": "skill", "resource": "*", "effect": "deny" },
+        { "action": "skill", "resource": "css-py314-devel", "effect": "allow" },
+        { "action": "skill", "resource": "api-openapi-compat", "effect": "ask" },
+        { "action": "skill", "resource": "css-agent-factory", "effect": "ask" },
+        { "action": "skill", "resource": "css-skill-factory", "effect": "ask" },
+        { "action": "skill", "resource": "css-assistant-playwright", "effect": "ask" },
+        { "action": "skill", "resource": "css-orchestrator", "effect": "ask" },
+        { "action": "skill", "resource": "css-project-mgmt", "effect": "ask" },
+        { "action": "skill", "resource": "devel-lib-*", "effect": "allow" },
+        { "action": "skill", "resource": "opencode-cli-planner", "effect": "ask" },
+        { "action": "skill", "resource": "token-optimization", "effect": "ask" },
+        { "action": "skill", "resource": "css-review", "effect": "allow" },
+        { "action": "skill", "resource": "devel-lib-shadcn", "effect": "allow" },
+        { "action": "subagent", "resource": "*", "effect": "deny" },
+        { "action": "subagent", "resource": "css-reviewer", "effect": "allow" },
+        { "action": "subagent", "resource": "css-factory", "effect": "allow" },
+        { "action": "subagent", "resource": "css-developer", "effect": "allow" },
+        { "action": "subagent", "resource": "css-tester", "effect": "allow" },
+        { "action": "css*ide_*", "resource": "*", "effect": "allow" },
+        { "action": "css*ide_apply_patch", "resource": "*", "effect": "deny" },
+        { "action": "css*ide_execute_tool", "resource": "*", "effect": "deny" },
+        { "action": "css*ide_execute_terminal_command", "resource": "*", "effect": "deny" },
+        { "action": "css*git_*", "resource": "*", "effect": "allow" },
+        { "action": "css*todo_owner", "resource": "*", "effect": "allow" },
+        { "action": "css*todo_list", "resource": "*", "effect": "allow" },
+        { "action": "css*todo_get", "resource": "*", "effect": "allow" },
+        { "action": "css*session_quicksearch", "resource": "*", "effect": "allow" },
+        { "action": "css*history_lookup", "resource": "*", "effect": "allow" },
+        { "action": "external_directory", "resource": "/tmp/opencode/*", "effect": "allow" },
+        { "action": "external_directory", "resource": "$HOME/.local/share/opencode/*", "effect": "allow" },
+        { "action": "external_directory", "resource": "$HOME/.local/share/css-mcp/*", "effect": "allow" },
+        { "action": "external_directory", "resource": "$HOME/Projects/css-mcp-opencode-plugin/*", "effect": "allow" },
+        { "action": "shell", "resource": "git *", "effect": "ask" },
+        { "action": "edit", "resource": "pyproject.toml", "effect": "allow" },
+        { "action": "edit", "resource": "**/plan.md", "effect": "deny" }
+      ]
+    },
+    "css-factory": {
+      "mode": "all",
+      "permissions": [
+        { "action": "*", "resource": "*", "effect": "deny" },
+        { "action": "*", "resource": "**/plan.md", "effect": "deny" },
+        { "action": "read", "resource": "*", "effect": "allow" },
+        { "action": "read", "resource": "**/plan.md", "effect": "allow" },
+        { "action": "read", "resource": "*.env", "effect": "deny" },
+        { "action": "read", "resource": "*.env.*", "effect": "deny" },
+        { "action": "read", "resource": "*.env.example", "effect": "allow" },
+        { "action": "edit", "resource": ".opencode/**/*.md", "effect": "allow" },
+        { "action": "edit", "resource": ".opencode/**/*.json", "effect": "allow" },
+        { "action": "edit", "resource": ".opencode/**/*.jsonc", "effect": "allow" },
+        { "action": "edit", "resource": ".opencode/**/*.sh", "effect": "allow" },
+        { "action": "edit", "resource": ".opencode/**/*.py", "effect": "allow" },
+        { "action": "edit", "resource": ".opencode/opencode.json", "effect": "deny" },
+        { "action": "edit", "resource": "AGENTS.md", "effect": "allow" },
+        { "action": "grep", "resource": "*", "effect": "allow" },
+        { "action": "glob", "resource": "*", "effect": "allow" },
+        { "action": "shell", "resource": "sqlite*", "effect": "deny" },
+        { "action": "shell", "resource": "git*", "effect": "deny" },
+        { "action": "shell", "resource": "git status*", "effect": "allow" },
+        { "action": "shell", "resource": "git diff*", "effect": "allow" },
+        { "action": "shell", "resource": "python3 .opencode/skills/*", "effect": "allow" },
+        { "action": "shell", "resource": "ls *", "effect": "allow" },
+        { "action": "shell", "resource": "grep *", "effect": "allow" },
+        { "action": "shell", "resource": "cat *", "effect": "allow" },
+        { "action": "webfetch", "resource": "*", "effect": "allow" },
+        { "action": "websearch", "resource": "*", "effect": "allow" },
+        { "action": "question", "resource": "*", "effect": "allow" },
+        { "action": "skill", "resource": "css-*", "effect": "allow" },
+        { "action": "skill", "resource": "api-*", "effect": "allow" },
+        { "action": "skill", "resource": "token-optimization", "effect": "allow" },
+        { "action": "skill", "resource": "expanding-skill-questions", "effect": "allow" },
+        { "action": "subagent", "resource": "css-factory", "effect": "allow" },
+        { "action": "subagent", "resource": "css-reviewer", "effect": "ask" },
+        { "action": "css*ide_*", "resource": "*", "effect": "allow" },
+        { "action": "css*ide_apply_patch", "resource": "*", "effect": "deny" },
+        { "action": "css*git_*", "resource": "*", "effect": "allow" },
+        { "action": "edit", "resource": "**/opencode.json", "effect": "deny" }
+      ]
+    },
+    "css-reviewer": {
+      "mode": "all",
+      "permissions": [
+        { "action": "*", "resource": "*", "effect": "deny" },
+        { "action": "read", "resource": "*", "effect": "allow" },
+        { "action": "read", "resource": "*.env", "effect": "deny" },
+        { "action": "read", "resource": "*.env.*", "effect": "deny" },
+        { "action": "read", "resource": "*.env.example", "effect": "allow" },
+        { "action": "grep", "resource": "*", "effect": "allow" },
+        { "action": "glob", "resource": "*", "effect": "allow" },
+        { "action": "webfetch", "resource": "*", "effect": "allow" },
+        { "action": "websearch", "resource": "*", "effect": "allow" },
+        { "action": "shell", "resource": "*", "effect": "deny" },
+        { "action": "shell", "resource": "uv run ruff check --diff*", "effect": "allow" },
+        { "action": "shell", "resource": "sed -n *", "effect": "allow" },
+        { "action": "shell", "resource": "head *", "effect": "allow" },
+        { "action": "shell", "resource": "tail *", "effect": "allow" },
+        { "action": "shell", "resource": "grep *", "effect": "allow" },
+        { "action": "shell", "resource": "echo *", "effect": "allow" },
+        { "action": "question", "resource": "*", "effect": "allow" },
+        { "action": "subagent", "resource": "*", "effect": "deny" },
+        { "action": "skill", "resource": "*", "effect": "deny" },
+        { "action": "skill", "resource": "api-openapi-compat", "effect": "allow" },
+        { "action": "skill", "resource": "api-opencode-cli", "effect": "allow" },
+        { "action": "skill", "resource": "css-project-mgmt", "effect": "allow" },
+        { "action": "skill", "resource": "css-py314-devel", "effect": "allow" },
+        { "action": "skill", "resource": "devel-lib-fastmcp", "effect": "allow" },
+        { "action": "skill", "resource": "devel-lib-msgspec", "effect": "allow" },
+        { "action": "skill", "resource": "devel-lib-shadcn", "effect": "allow" },
+        { "action": "skill", "resource": "devel-lib-tortoise", "effect": "allow" },
+        { "action": "skill", "resource": "devel-lib-tortoise-extended", "effect": "allow" },
+        { "action": "skill", "resource": "devel-lib-aiohttp_httpx", "effect": "allow" },
+        { "action": "skill", "resource": "devel-lib-aiofile", "effect": "allow" },
+        { "action": "skill", "resource": "css-review", "effect": "allow" },
+        { "action": "skill", "resource": "token-optimization", "effect": "allow" },
+        { "action": "skill", "resource": "devel-lib-shadcn", "effect": "allow" },
+        { "action": "css*git_status", "resource": "*", "effect": "allow" },
+        { "action": "css*git_diff", "resource": "*", "effect": "allow" },
+        { "action": "css*git_log", "resource": "*", "effect": "allow" },
+        { "action": "css*git_show", "resource": "*", "effect": "allow" },
+        { "action": "css*git_blame", "resource": "*", "effect": "allow" },
+        { "action": "css*git_reflog", "resource": "*", "effect": "allow" },
+        { "action": "css*git_changelog_analyze", "resource": "*", "effect": "allow" },
+        { "action": "css*ide_lint_files", "resource": "*", "effect": "allow" },
+        { "action": "css*ide_get_*", "resource": "*", "effect": "allow" },
+        { "action": "css*ide_list_*", "resource": "*", "effect": "allow" },
+        { "action": "css*ide_search_*", "resource": "*", "effect": "allow" },
+        { "action": "css*ide_analyze_calls", "resource": "*", "effect": "allow" },
+        { "action": "css*sqlite_*", "resource": "*", "effect": "allow" },
+        { "action": "css*session_quicksearch", "resource": "*", "effect": "allow" },
+        { "action": "css*history_lookup", "resource": "*", "effect": "allow" },
+        { "action": "external_directory", "resource": "$HOME/.local/share/opencode/*", "effect": "allow" }
+      ]
+    },
+    "css-cybersec": {
+      "mode": "all",
+      "permissions": [
+        { "action": "*", "resource": "*", "effect": "deny" },
+        { "action": "read", "resource": "*", "effect": "allow" },
+        { "action": "read", "resource": "*.env", "effect": "deny" },
+        { "action": "read", "resource": "*.env.*", "effect": "deny" },
+        { "action": "read", "resource": "*.env.example", "effect": "allow" },
+        { "action": "grep", "resource": "*", "effect": "allow" },
+        { "action": "glob", "resource": "*", "effect": "allow" },
+        { "action": "shell", "resource": "*", "effect": "deny" },
+        { "action": "subagent", "resource": "*", "effect": "deny" },
+        { "action": "skill", "resource": "*", "effect": "deny" },
+        { "action": "skill", "resource": "css-review", "effect": "allow" },
+        { "action": "css*git_status", "resource": "*", "effect": "allow" },
+        { "action": "css*git_diff", "resource": "*", "effect": "allow" },
+        { "action": "css*git_log", "resource": "*", "effect": "allow" },
+        { "action": "css*git_show", "resource": "*", "effect": "allow" },
+        { "action": "css*git_blame", "resource": "*", "effect": "allow" },
+        { "action": "css*git_reflog", "resource": "*", "effect": "allow" },
+        { "action": "css*git_changelog_analyze", "resource": "*", "effect": "allow" },
+        { "action": "css*ide_lint_files", "resource": "*", "effect": "allow" },
+        { "action": "css*ide_get_*", "resource": "*", "effect": "allow" },
+        { "action": "css*ide_list_*", "resource": "*", "effect": "allow" },
+        { "action": "css*ide_search_*", "resource": "*", "effect": "allow" },
+        { "action": "css*ide_analyze_calls", "resource": "*", "effect": "allow" },
+        { "action": "css*sqlite*", "resource": "*", "effect": "allow" },
+        { "action": "css*ghidra*", "resource": "*", "effect": "allow" },
+        { "action": "css*rea*", "resource": "*", "effect": "allow" },
+        { "action": "css*sqlite_query", "resource": "*", "effect": "allow" },
+        { "action": "css*todo_owner", "resource": "*", "effect": "allow" },
+        { "action": "css*todo_list", "resource": "*", "effect": "allow" },
+        { "action": "css*todo_get", "resource": "*", "effect": "allow" }
+      ]
+    },
+    "css-tester": {
+      "mode": "subagent",
+      "permissions": [
+        { "action": "*", "resource": "*", "effect": "deny" },
+        { "action": "read", "resource": "*", "effect": "allow" },
+        { "action": "read", "resource": "*.env", "effect": "deny" },
+        { "action": "read", "resource": "*.env.*", "effect": "deny" },
+        { "action": "read", "resource": "*.env.example", "effect": "allow" },
+        { "action": "glob", "resource": "*", "effect": "allow" },
+        { "action": "grep", "resource": "*", "effect": "allow" },
+        { "action": "edit", "resource": "tests/**/*.py", "effect": "allow" },
+        { "action": "shell", "resource": "*", "effect": "deny" },
+        { "action": "shell", "resource": "uv run pytest *", "effect": "allow" },
+        { "action": "shell", "resource": "uv run --group test pytest *", "effect": "allow" },
+        { "action": "shell", "resource": "uv run ruff check --diff*", "effect": "allow" },
+        { "action": "shell", "resource": "tail *", "effect": "allow" },
+        { "action": "shell", "resource": "head *", "effect": "allow" },
+        { "action": "shell", "resource": "grep *", "effect": "allow" },
+        { "action": "shell", "resource": "cd *", "effect": "allow" },
+        { "action": "shell", "resource": "ls *", "effect": "allow" },
+        { "action": "shell", "resource": "echo *", "effect": "allow" },
+        { "action": "shell", "resource": "cat *", "effect": "allow" },
+        { "action": "shell", "resource": "* tail *", "effect": "allow" },
+        { "action": "shell", "resource": "* head *", "effect": "allow" },
+        { "action": "shell", "resource": "* grep *", "effect": "allow" },
+        { "action": "shell", "resource": "* cd *", "effect": "allow" },
+        { "action": "shell", "resource": "* ls *", "effect": "allow" },
+        { "action": "shell", "resource": "* echo *", "effect": "allow" },
+        { "action": "shell", "resource": "* cat *", "effect": "allow" },
+        { "action": "subagent", "resource": "*", "effect": "deny" },
+        { "action": "skill", "resource": "*", "effect": "deny" },
+        { "action": "skill", "resource": "css-py314-devel", "effect": "allow" },
+        { "action": "skill", "resource": "css-review", "effect": "allow" },
+        { "action": "*ide_lint_files", "resource": "*", "effect": "allow" },
+        { "action": "*ide_get_file_problems", "resource": "*", "effect": "allow" },
+        { "action": "edit", "resource": "tests/*.py", "effect": "allow" }
+      ]
+    },
+    "css-assistant": {
+      "mode": "subagent",
+      "model": "local/qwen3:06b-gpuonly",
+      "permissions": [
+        { "action": "*", "resource": "*", "effect": "deny" },
+        { "action": "*", "resource": "*", "effect": "deny" }
+      ]
+    },
+    "css-vision": {
+      "mode": "subagent",
+      "model": "local/moondream:latest-gpuonly"
+    },
+    "css-embed": {
+      "mode": "subagent",
+      "model": "local/qwen3-embedding:0.6b"
+    },
+    "css-reconnect": {
+      "mode": "subagent",
+      "model": "local/qwen3:06b-gpuonly",
+      "permissions": [
+        { "action": "css*", "resource": "*", "effect": "deny" },
+        { "action": "*fritzbox_reconnect", "resource": "*", "effect": "allow" },
+        { "action": "*get_public_ip", "resource": "*", "effect": "allow" }
+      ],
+      "system": "You only have the job to call fritzbox_reconnect when you're told to. and to `test` respond with `works`"
+    }
+  }
 }
