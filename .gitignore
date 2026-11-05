@@ -42,3 +42,6 @@ htmlcov/
 .ai
 .venv
 
+# Local opencode workspace config (agents, permissions, plugin wiring)
+.opencode/
+
