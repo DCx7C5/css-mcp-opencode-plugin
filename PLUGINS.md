@@ -1,9 +1,9 @@
 # Plugins — feature reference
 
-This repo ships **six per-concern plugins** plus a shared transport. Each plugin
+This repo ships **seven per-concern plugins** plus a shared transport. Each plugin
 registers only its own hook surface; they all import the `plugins/transport.js` ESM
 singleton, so every plugin in a process shares **one** socket, **one** bootstrap
-handshake, and **one** capability gate — loading one plugin or all six is
+handshake, and **one** capability gate — loading one plugin or all seven is
 functionally identical.
 
 | plugin | file | hook surface | authority |
@@ -14,6 +14,7 @@ functionally identical.
 | permission | `plugins/plugin-permission.js` | `permission.ask` | yes/no popups → Python |
 | context | `plugins/plugin-context.js` | `experimental.session.compacting`, `event` (context syncs) | context interface → Python |
 | events | `plugins/plugin-events.js` | `event` | observer-only forwarding → Python |
+| signals | `plugins/plugin-signals.js` | `event` | pattern detector → Python `signal` |
 
 ---
 
@@ -32,6 +33,7 @@ plugin a hook line came from, which it cannot tell from the JSON alone.
 | `p:` | plugin-permission | `permission`, its own `event` lines |
 | `c:` | plugin-context | `context` (compacting + context syncs) |
 | `e:` | plugin-events | `event.pipeline`, fire-and-forget `event` |
+| `e:` | plugin-signals | `signal` (rare, action-request RPC) |
 | `s:` | plugin-secrets | **never** — the hardblock is local-only, no socket bytes |
 
 Bridge-level ops (`bootstrap`, `config`) and every Py→JS line are unprefixed.
@@ -268,11 +270,54 @@ Tracked event list lives in `transport.js` (`TRACKED_EVENTS` +
 
 ---
 
+## plugin-signals.js — pattern detector
+
+Watches the same event bus locally and emits one `signal` RPC when a configured
+phrase matches. Detection stays in the plugin (the event text is already in the
+JS process); all action logic stays in Python. This is distinct from
+`plugin-events.js`: events are fire-and-forget observation, a signal is a rare
+action request.
+
+Watched surfaces:
+
+| event | text extracted |
+|-------|----------------|
+| `session.next.text.ended` | `properties.text` (normal assistant text) |
+| `session.error` | `properties.error` (stringified provider error) |
+| `session.next.step.failed` | `properties.error` |
+| `tui.toast.show` | `title` + `message` |
+| `message.part.updated` | completed, non-synthetic `text` parts only (fallback for runtimes that emit parts without `session.next.*`) |
+
+Default pattern:
+
+```json
+{ "id": "free_messages_exhausted", "contains": "You've used today's free messages. They reset at" }
+```
+
+Matching normalizes typographic apostrophes and runs of whitespace. The
+cooldown is **10 minutes per signal/session**; the Python action registry keeps
+the authoritative global cooldown, so a plugin reload or a second connection
+cannot re-trigger the action.
+
+Wire body (`e:signal`, sent with `wait:false` — the event loop never waits for
+the brain):
+
+```json
+{ "signal": "free_messages_exhausted", "sessionID": "…", "messageID": "…",
+  "matched": "…", "excerpt": "…≤500 chars…", "at": 1730000000000, "directory": "…" }
+```
+
+Python replies `{accepted: boolean, signal, action?, dispatched?, deduped?, reason?}`.
+An older brain without the op replies `ok:false` (unknown op); the plugin logs it
+at debug and continues forwarding events.
+
+---
+
 ## plugins/index.js — aggregator (npm/GitHub default)
 
 `package.json` `main`. The default export is a single opencode v2 plugin
 definition (`{ id: "css-mcp-opencode-plugin", setup(ctx) }`) that registers all
-six concerns through `opencode-v2.js` (v1-hook → v2-domain-hook adapter) while
+seven concerns through `opencode-v2.js` (v1-hook → v2-domain-hook adapter) while
 sharing one transport. The named `server` re-exports are kept for opencode 1.x
 and direct imports. Behavior is identical to the per-file entries.
 
@@ -329,6 +374,7 @@ replies additionally carry `c:`/`t:`/`p:`):
 | `context` | `{}` default · `{prompt: string}` replace · `{context: string \| object[]}` inject | compaction decision | non-blocking, default used on error |
 | `event.pipeline` | `{}` informational | — | host never awaits; errors swallowed |
 | `event` | **no reply** (fire-and-forget) | — | server must not reply to NO_REPLY ops |
+| `signal` | `{accepted: boolean, signal: string, action?: string, dispatched?: boolean, deduped?: boolean, reason?: string}` | action registry result | non-blocking (sent `wait:false`); unknown signal name → `accepted:false` |
 
 ### Reverse-RPC replies (JS→Py, prefixed `c:`/`t:`/`p:`)
 
@@ -397,5 +443,9 @@ uv run --group test pytest   # scripts/client.py smoke tests
 - `tests/plugins.prefix.test.mjs` — raw-line wire assertions: every plugin
   emits its owning letter prefix (`h`/`t`/`p`/`c`/`e`), `bootstrap`/`config`
   stay unprefixed, and reverse-RPC replies carry `c:`/`t:`/`p:`.
+- `tests/plugins.signals.test.mjs` — pattern detection on assistant text,
+  provider errors, TUI toasts, and completed text parts (`properties` and
+  durable `data`); synthetic/streaming parts ignored; 10-minute per-session
+  cooldown; `e:signal` body shape and reply handling.
 - `tests/test_client.py` — `strip_plugin_prefix` unit tests (serve/stream
   decode paths in `scripts/client.py`).

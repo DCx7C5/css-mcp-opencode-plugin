@@ -8,7 +8,7 @@ Unix socket; all decision logic lives in a Python "brain".
 - **Shared transport** (`plugins/transport.js`) — one socket connection pool, one
   bootstrap handshake, one capability gate, one event debouncer, one
   `session.inject` consumer. Every plugin shares it (ESM singletons), so loading
-  one plugin or all six is functionally identical.
+  one plugin or all seven is functionally identical.
 - **Per-concern plugins** (`plugins/`) — each registers only its own hooks:
 
   | plugin | hook surface | authority |
@@ -21,7 +21,7 @@ Unix socket; all decision logic lives in a Python "brain".
   | `plugin-events.js` | `event` | observer-only forwarding → Python (`event`/`event.pipeline`) |
 
 - **Aggregator** (`plugins/index.js`) — the repo's npm/GitHub default
-  (`package.json` `main`); loads all six plugins from one entry via opencode's
+  (`package.json` `main`); loads all seven plugins from one entry via opencode's
   multi-export plugin loading.
 - **Python brain** — *not part of this repo.* It is an external server that
   listens on the socket and owns permission rules, task management, event
@@ -82,7 +82,7 @@ that always holds, even with no brain.
 npm install css-mcp-opencode-plugin
 ```
 
-Loads the aggregator `plugins/index.js` (all six plugins, one entry; its
+Loads the aggregator `plugins/index.js` (all seven plugins, one entry; its
 default export is a single opencode v2 plugin definition that registers every
 concern through the shared transport).
 
@@ -99,7 +99,7 @@ concern through the shared transport).
 
 ### Split into plugins (one repo → many plugins)
 
-All six plugins live in this one repo and load individually via `opencode.json`.
+All seven plugins live in this one repo and load individually via `opencode.json`.
 `plugins/` deliberately has **no `package.json`**, so opencode resolves each file
 entry to the exact file (not the package `main`):
 
@@ -119,7 +119,7 @@ entry to the exact file (not the package `main`):
 
 Order matters: `plugin-secrets.js` first so the local hardblock runs before the
 Python gate. To load all of them from a single entry instead, point at
-`plugins/index.js` — its v2 default definition registers all six concerns —
+`plugins/index.js` — its v2 default definition registers all seven concerns —
 this is also the npm/GitHub default. (Every plugin also keeps its v1 named
 `server` export; opencode 1.x loads the per-file entries the legacy way.)
 
@@ -135,13 +135,13 @@ to apply to every project.
 
 | form | entry | loads |
 |------|-------|-------|
-| npm package | `"plugins": ["css-mcp-opencode-plugin"]` | all six via `main` (`plugins/index.js`) |
-| GitHub URL | `"plugins": ["github:DCx7C5/css-mcp-opencode-plugin"]` | all six via `main` |
+| npm package | `"plugins": ["css-mcp-opencode-plugin"]` | all seven via `main` (`plugins/index.js`) |
+| GitHub URL | `"plugins": ["github:DCx7C5/css-mcp-opencode-plugin"]` | all seven via `main` |
 | local per-file | `"plugins": ["../plugins/plugin-secrets.js", …]` | exactly the listed plugins (project-local dev) |
-| local aggregator | `"plugins": ["../plugins/index.js"]` | all six, one entry |
+| local aggregator | `"plugins": ["../plugins/index.js"]` | all seven, one entry |
 | single plugin | `"plugins": ["../plugins/plugin-secrets.js"]` | one plugin only |
 
-Example — project `.opencode/opencode.json`, all six from this repo:
+Example — project `.opencode/opencode.json`, all seven from this repo:
 
 ```json
 {
