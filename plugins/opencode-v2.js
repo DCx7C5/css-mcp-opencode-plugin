@@ -35,6 +35,94 @@ const safe = async (fn, fallback) => {
 }
 
 /**
+ * How long a session counts as active for `session.broadcast`. A session that
+ * ran inside this window still resumes after it has gone idle — the rate-limit
+ * error that started the incident may already have ended its turn.
+ */
+const ACTIVE_WINDOW_MS = Number(process.env.OPENCODE_BROADCAST_WINDOW_MS ?? 30 * 60 * 1000)
+
+/** cb → (sessionID → timestamp of the last observed running transition). */
+const activity = new WeakMap()
+
+/**
+ * The activity map for one plugin context.
+ * @param {object} ctx
+ * @returns {Map<string, number>}
+ */
+const activityOf = (ctx) => {
+    let map = activity.get(ctx)
+    if (!map) {
+        map = new Map()
+        activity.set(ctx, map)
+    }
+    return map
+}
+
+/**
+ * Record a session as running. Entries older than the window are pruned once
+ * the map grows, so a long-lived client cannot accumulate them.
+ * @param {Map<string, number>} map
+ * @param {string} sessionID
+ * @param {number} [at]
+ */
+const noteActive = (map, sessionID, at = Date.now()) => {
+    if (typeof sessionID !== "string" || !sessionID) return
+    map.set(sessionID, at)
+    if (map.size > 256) {
+        const cutoff = at - ACTIVE_WINDOW_MS
+        for (const [id, seen] of map) if (seen < cutoff) map.delete(id)
+    }
+}
+
+/**
+ * Learn which sessions are running from the event stream.
+ *
+ * The v2 plugin context has no `session.active`/`session.status` — verified
+ * against the runtime's own `@opencode/plugin` 2.2.5, whose SessionDomain is a
+ * fixed Pick of the client API. Events are the only source: `session.status`
+ * (busy/retry) and `session.execution.started` mark a session; an `idle`
+ * transition keeps the last mark, so a session that errored out mid-incident
+ * still counts for the window.
+ *
+ * @param {object} ctx — v2 plugin context.
+ */
+const startActivityTracker = (ctx) => {
+    if (!ctx || typeof ctx?.event?.subscribe !== "function" || activity.has(ctx)) return
+    const map = activityOf(ctx)
+    void (async () => {
+        try {
+            for await (const event of ctx.event.subscribe()) {
+                const sessionID = event?.data?.sessionID
+                if (!sessionID) continue
+                if (event.type === "session.status") {
+                    const status = event.data?.status?.type
+                    if (status === "busy" || status === "retry") noteActive(map, sessionID)
+                } else if (event.type === "session.execution.started") {
+                    noteActive(map, sessionID)
+                }
+            }
+        } catch {
+            // Subscription ended (plugin unload / ctx teardown) — nothing to do.
+        }
+    })()
+}
+
+/**
+ * Sessions that ran inside the window, in the v1 `active` shape
+ * (`{data: {sessionID: {type: "running"}}}`).
+ * @param {object} ctx
+ * @returns {{data: Record<string, {type: "running"}>}}
+ */
+const activeSessionMap = (ctx) => {
+    const data = {}
+    const now = Date.now()
+    for (const [sessionID, seen] of activityOf(ctx)) {
+        if (now - seen <= ACTIVE_WINDOW_MS) data[sessionID] = { type: "running" }
+    }
+    return { data }
+}
+
+/**
  * Adapt the v2 plugin context into the v1-shaped SDK client the transport
  * and the plugin gates call (session.promptAsync, session.get/messages,
  * session.create/prompt/abort/summarize, app.agents, tool.ids,
@@ -82,16 +170,22 @@ const adaptClient = (ctx) => {
                     },
                     { data: [] },
                 ),
+            // v2 exposes no `active`/`status`; the tracked map is the source.
+            // A build that does expose `active` is unioned in, so either way
+            // the broadcast sees every session that ran inside the window.
             active: () =>
                 safe(
                     async () => {
-                        const res = await session.active()
-                        const data = res?.data ?? res
-                        return {
-                            data: data && typeof data === "object" && !Array.isArray(data) ? data : {},
+                        const data = {}
+                        if (typeof session.active === "function") {
+                            const res = await session.active()
+                            const live = res?.data ?? res
+                            if (live && typeof live === "object" && !Array.isArray(live)) Object.assign(data, live)
                         }
+                        Object.assign(data, activeSessionMap(ctx).data)
+                        return { data }
                     },
-                    { data: {} },
+                    activeSessionMap(ctx),
                 ),
             create: ({ body = {}, query }) =>
                 safe(
@@ -282,6 +376,7 @@ async function registerV1Hook(ctx, v1Name, v1cb) {
  */
 export async function bridgeHooksV2(ctx, servers) {
     const location = ctx?.location ?? {}
+    startActivityTracker(ctx)
     const client = adaptClient(ctx)
     const dir = location.directory
     const proj = location.project

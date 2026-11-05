@@ -42,6 +42,21 @@ function makeCtx() {
     const registrations = {}
     /** @type {{prompt: object[], synthetic: object[]}} */
     const calls = { prompt: [], synthetic: [] }
+    /** @type {object[]} — buffered v2 events for the activity tracker. */
+    const events = []
+    let wake = null
+    const pushEvent = (event) => {
+        events.push(event)
+        wake?.()
+    }
+    const subscribe = () => ({
+        async *[Symbol.asyncIterator]() {
+            while (true) {
+                if (events.length === 0) await new Promise((resolve) => (wake = resolve))
+                while (events.length > 0) yield events.shift()
+            }
+        },
+    })
     const register = (domain, name) => async (hookName, cb) => {
         registrations[`${domain}:${hookName}`] = cb
         return { dispose: async () => {} }
@@ -57,7 +72,6 @@ function makeCtx() {
             get: async ({ sessionID }) => ({ id: sessionID, directory: "/proj" }),
             context: async ({ sessionID }) => [{ id: "msg1" }],
             list: async () => [{ id: "s1", time: { updated: Date.now() } }],
-            active: async () => ({ data: { s1: { type: "running" } } }),
             create: async (input) => ({ id: "s-new" }),
             prompt: async (input) => {
                 calls.prompt.push(input)
@@ -69,9 +83,9 @@ function makeCtx() {
             },
             interrupt: async () => ({}),
         },
-        event: { subscribe: async function* () {} },
+        event: { subscribe },
     }
-    return { ctx, registrations, calls }
+    return { ctx, registrations, calls, pushEvent }
 }
 
 const runSetup = async (name, ctx) => {
@@ -239,4 +253,26 @@ test("v2 promptAsync: noReply injects synthetic; a plain prompt starts a real tu
     })
     assert.deepEqual(calls.synthetic.map((call) => call.text), ["context"])
     assert.equal(calls.prompt.length, 1)
+})
+
+test("v2 activity tracker: status/execution events mark sessions broadcast-active", async () => {
+    const { ctx, pushEvent } = makeCtx()
+    const { bridgeHooksV2 } = await import(new URL("../plugins/opencode-v2.js", import.meta.url))
+    let adapted
+    await bridgeHooksV2(ctx, [
+        async ({ client }) => {
+            adapted = client
+            return {}
+        },
+    ])
+    pushEvent({ type: "session.status", data: { sessionID: "s-run", status: { type: "busy" } } })
+    pushEvent({
+        type: "session.status",
+        data: { sessionID: "s-429", status: { type: "retry", attempt: 1, message: "429", next: 0 } },
+    })
+    pushEvent({ type: "session.execution.started", data: { sessionID: "s-exec" } })
+    pushEvent({ type: "session.status", data: { sessionID: "s-idle", status: { type: "idle" } } })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    const res = await adapted.session.active()
+    assert.deepEqual(Object.keys(res.data).sort(), ["s-429", "s-exec", "s-run"])
 })

@@ -745,60 +745,93 @@ const REPLY_PREFIX = {
     "permission.answer": PLUGIN_PREFIX.permission,
 }
 
-/** Sessions updated within this window count as active when the SDK exposes
- * neither `session.active` nor `session.status`. */
+/** Sessions updated within this window still count as having been active
+ * during the incident — a session that stopped on the rate-limit error has no
+ * newer `time.updated` than the moment it gave up. */
 const BROADCAST_ACTIVE_MS = 30 * 60 * 1000
 
 /** v1 `SessionStatus` values that mean the session is engaged. */
 const RUNNING_STATUS = new Set(["busy", "retry"])
 
 /**
- * IDs the broadcast must reach.
+ * IDs the broadcast must reach: every session that ran during the incident
+ * window, i.e. the runtime's own running set when it exposes one, unioned with
+ * the sessions whose `time.updated` falls inside `BROADCAST_ACTIVE_MS`.
  *
- * Prefers the runtime's own running set — `session.active` on v2
- * (`{data: {sessionID: {type: "running"}}}`) or `session.status` on v1
- * (`{data: {sessionID: {type: "busy"|"retry"|"idle"}}}`). The list + recency
- * window is the last resort for an SDK that exposes neither.
+ * The union matters: a session that errored out on the rate limit is idle by
+ * the time the resume arrives, so a running-only set would miss exactly the
+ * sessions that need waking. Archived sessions and child (subagent) sessions
+ * never receive a prompt. Each source is best-effort — one failing call
+ * degrades the target set, never the push handler.
+ *
+ * `session.active` is the v2 client surface (`{[id]: {type:"running"}}`) and
+ * `session.status` the v1 one (`busy`/`retry`/`idle`).
  *
  * @param {object} client Active SDK-shaped client.
  * @returns {Promise<string[]>}
  */
 async function activeSessionIDs(client) {
-    if (typeof client.session.active === "function") {
-        const res = await client.session.active()
-        const data = res?.data ?? res
-        return data && typeof data === "object" && !Array.isArray(data) ? Object.keys(data) : []
-    }
-    if (typeof client.session.status === "function") {
-        const res = await client.session.status()
-        const data = res?.data ?? res
-        if (data && typeof data === "object" && !Array.isArray(data)) {
-            return Object.entries(data)
-                .filter(([, status]) => RUNNING_STATUS.has(status?.type))
-                .map(([sessionID]) => sessionID)
+    const ids = new Set()
+    const children = new Set()
+    if (typeof client.session.list === "function") {
+        try {
+            const listed = await client.session.list()
+            const sessions = Array.isArray(listed?.data) ? listed.data : []
+            const now = Date.now()
+            for (const session of sessions) {
+                if (!session?.id) continue
+                // Child (subagent) sessions are not tabs and never resume.
+                if (session.parentID) {
+                    children.add(session.id)
+                    continue
+                }
+                if (session.time?.archived) continue
+                if (now - (session.time?.updated ?? 0) <= BROADCAST_ACTIVE_MS) ids.add(session.id)
+            }
+        } catch {
+            // Source unavailable — whatever the running set yields stands.
         }
-        return []
     }
-    const listed = await client.session.list()
-    const sessions = Array.isArray(listed?.data) ? listed.data : []
-    const now = Date.now()
-    return sessions
-        .filter((session) => now - (session?.time?.updated ?? 0) <= BROADCAST_ACTIVE_MS)
-        .map((session) => session.id)
+    if (typeof client.session.active === "function") {
+        try {
+            const res = await client.session.active()
+            const data = res?.data ?? res
+            if (data && typeof data === "object" && !Array.isArray(data)) {
+                for (const sessionID of Object.keys(data)) ids.add(sessionID)
+            }
+        } catch {
+            // Source unavailable.
+        }
+    } else if (typeof client.session.status === "function") {
+        try {
+            const res = await client.session.status()
+            const data = res?.data ?? res
+            if (data && typeof data === "object" && !Array.isArray(data)) {
+                for (const [sessionID, status] of Object.entries(data)) {
+                    if (RUNNING_STATUS.has(status?.type)) ids.add(sessionID)
+                }
+            }
+        } catch {
+            // Source unavailable.
+        }
+    }
+    for (const id of children) ids.delete(id)
+    return [...ids]
 }
 
 /**
- * Prompt every actively running session — the `session.broadcast` push consumer.
+ * Prompt every session that was active during the incident — the
+ * `session.broadcast` push consumer.
  *
- * Python only says "send this prompt"; which sessions exist and which are
- * running is decided here, from the live SDK. The text is a plain user part
- * (no `synthetic` flag): it must behave like the same text typed into the
- * prompt window, not like hidden context. `promptAsync` starts the agent if
- * needed and returns immediately, so a busy session still receives the prompt
- * on its next turn rather than blocking the push handler.
+ * Python only says "send this prompt"; which sessions exist and which ran is
+ * decided here, from the live SDK. The text is a plain user part (no
+ * `synthetic` flag): it must behave like the same text typed into the prompt
+ * window, not like hidden context. `promptAsync` returns immediately, so a busy
+ * session still receives the prompt on its next turn rather than blocking the
+ * push handler.
  *
  * @param {string} id Push id (log correlation only; no reply is sent).
- * @param {string} prompt Text pushed into every running session.
+ * @param {string} prompt Text pushed into every active session.
  * @param {string|null} sessionID Optional single target.
  */
 async function broadcastPrompt(id, prompt, sessionID = null) {

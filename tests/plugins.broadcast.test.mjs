@@ -1,7 +1,7 @@
 /**
  * session.broadcast consumer — Python pushes {id, prompt}; transport prompts
- * every RUNNING session (`session.active` / `session.status`) or one explicit
- * sessionID, falling back to a recency window only for older SDKs.
+ * every session that ran during the incident window (runtime running set ∪
+ * recently updated sessions) or one explicit sessionID.
  */
 import { test, before, after } from "node:test"
 import assert from "node:assert/strict"
@@ -20,6 +20,8 @@ const SESSIONS = [
     { id: "s-recent", time: { updated: now - 60_000 } },
     { id: "s-recent-2", time: { updated: now - 5 * 60_000 } },
     { id: "s-stale", time: { updated: now - 3 * 60 * 60_000 } },
+    { id: "s-archived", time: { updated: now - 60_000, archived: now - 60_000 } },
+    { id: "s-child", parentID: "s-recent", time: { updated: now - 60_000 } },
 ]
 
 const delivered = []
@@ -70,7 +72,7 @@ after(async () => {
     rmSync(dir, { recursive: true, force: true })
 })
 
-test("broadcast prompts every recently active session and skips the stale one", async () => {
+test("broadcast prompts every recently active session, skips stale and archived", async () => {
     delete client.session.active
     delete client.session.status
     brainSend({ type: "push", channel: "session.broadcast", body: { id: "b1", prompt: "standup" } })
@@ -88,16 +90,18 @@ test("a sessionID targets one session regardless of age", async () => {
     assert.deepEqual(delivered, [{ text: "ping", sessionID: "s-stale", synthetic: undefined }])
 })
 
-test("session.active wins: only running sessions are prompted", async () => {
+test("running set is unioned with recently active sessions", async () => {
     delivered.length = 0
     delete client.session.status
-    client.session.active = async () => ({ data: { "s-live": { type: "running" } } })
+    client.session.active = async () => ({
+        data: { "s-live": { type: "running" }, "s-child": { type: "running" } },
+    })
     brainSend({ type: "push", channel: "session.broadcast", body: { id: "b3", prompt: "resume" } })
     await settle()
-    assert.deepEqual(delivered, [{ text: "resume", sessionID: "s-live", synthetic: undefined }])
+    assert.deepEqual(delivered.map((d) => d.sessionID).sort(), ["s-live", "s-recent", "s-recent-2"])
 })
 
-test("session.status fallback: busy and retry sessions are prompted, idle is not", async () => {
+test("session.status fallback: busy/retry sessions are prompted, idle is not", async () => {
     delivered.length = 0
     delete client.session.active
     client.session.status = async () => ({
@@ -109,5 +113,5 @@ test("session.status fallback: busy and retry sessions are prompted, idle is not
     })
     brainSend({ type: "push", channel: "session.broadcast", body: { id: "b4", prompt: "resume" } })
     await settle()
-    assert.deepEqual(delivered.map((d) => d.sessionID).sort(), ["s-busy", "s-retry"])
+    assert.deepEqual(delivered.map((d) => d.sessionID).sort(), ["s-busy", "s-recent", "s-recent-2", "s-retry"])
 })
