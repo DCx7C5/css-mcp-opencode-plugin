@@ -24,6 +24,7 @@ const plugins = {
     permission: "plugin-permission.js",
     context: "plugin-context.js",
     events: "plugin-events.js",
+    signals: "plugin-signals.js",
 }
 
 const mod = async (name) => (await import(new URL(`../plugins/${plugins[name]}`, import.meta.url))).default
@@ -188,7 +189,7 @@ test("task: gate enrichment resolves via stubbed v2 ctx (agents/tools)", async (
     await cleanup()
 })
 
-test("aggregator: index.js default registers all six concerns", async () => {
+test("aggregator: index.js default registers all seven concerns", async () => {
     const index = await import(new URL("../plugins/index.js", import.meta.url))
     assert.equal(typeof index.default, "object")
     assert.equal(index.default.id, "css-mcp-opencode-plugin")
