@@ -67,6 +67,32 @@ const adaptClient = (ctx) => {
                 safe(async () => ({ data: await session.context({ sessionID: path.id }) }), {
                     data: [],
                 }),
+            list: () =>
+                safe(
+                    async () => {
+                        const res = await session.list()
+                        const data = Array.isArray(res)
+                            ? res
+                            : Array.isArray(res?.data)
+                              ? res.data
+                              : Array.isArray(res?.sessions)
+                                ? res.sessions
+                                : []
+                        return { data }
+                    },
+                    { data: [] },
+                ),
+            active: () =>
+                safe(
+                    async () => {
+                        const res = await session.active()
+                        const data = res?.data ?? res
+                        return {
+                            data: data && typeof data === "object" && !Array.isArray(data) ? data : {},
+                        }
+                    },
+                    { data: {} },
+                ),
             create: ({ body = {}, query }) =>
                 safe(
                     async () => {
@@ -98,15 +124,28 @@ const adaptClient = (ctx) => {
                     },
                     { error: { message: "session.prompt unavailable (v2 ctx)" } },
                 ),
-            // The injector used v1 promptAsync (fire-and-forget synthetic
-            // part). v2 has a first-class `session.synthetic` for exactly this.
+            // v1 has two promptAsync callers: the injector sends a synthetic
+            // part with `noReply: true` (context, no turn), while
+            // `session.broadcast` sends a bare user prompt that must start a
+            // turn — the prompt-window equivalent. v2 splits these: synthetic
+            // messages never reply, real prompts go through `session.prompt`.
             promptAsync: ({ path, body = {} }) =>
                 safe(
                     async () => {
-                        await session.synthetic({ sessionID: path.id, text: textOf(body.parts) })
+                        const text = textOf(body.parts)
+                        if (body.noReply) {
+                            await session.synthetic({ sessionID: path.id, text })
+                            return {}
+                        }
+                        // Fire-and-forget: a real prompt resolves only after
+                        // the turn finishes, and the push handler must not be
+                        // held open for it.
+                        void Promise.resolve()
+                            .then(() => session.prompt({ sessionID: path.id, text }))
+                            .catch(() => {})
                         return {}
                     },
-                    { error: { message: "session.synthetic unavailable (v2 ctx)" } },
+                    { error: { message: "session.prompt unavailable (v2 ctx)" } },
                 ),
             // v2 has no forced-summarize surface; degrade gracefully so the
             // reverse-RPC answers 'not supported' rather than hanging.

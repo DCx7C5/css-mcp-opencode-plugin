@@ -40,6 +40,8 @@ after(async () => {
 function makeCtx() {
     /** @type {Record<string, Function>} */
     const registrations = {}
+    /** @type {{prompt: object[], synthetic: object[]}} */
+    const calls = { prompt: [], synthetic: [] }
     const register = (domain, name) => async (hookName, cb) => {
         registrations[`${domain}:${hookName}`] = cb
         return { dispose: async () => {} }
@@ -54,14 +56,22 @@ function makeCtx() {
             hook: register("session", null),
             get: async ({ sessionID }) => ({ id: sessionID, directory: "/proj" }),
             context: async ({ sessionID }) => [{ id: "msg1" }],
+            list: async () => [{ id: "s1", time: { updated: Date.now() } }],
+            active: async () => ({ data: { s1: { type: "running" } } }),
             create: async (input) => ({ id: "s-new" }),
-            prompt: async () => ({ user: { message: { role: "assistant", parts: [] } }, parts: [{ type: "text", text: "done" }] }),
-            synthetic: async () => ({}),
+            prompt: async (input) => {
+                calls.prompt.push(input)
+                return { user: { message: { role: "assistant", parts: [] } }, parts: [{ type: "text", text: "done" }] }
+            },
+            synthetic: async (input) => {
+                calls.synthetic.push(input)
+                return {}
+            },
             interrupt: async () => ({}),
         },
         event: { subscribe: async function* () {} },
     }
-    return { ctx, registrations }
+    return { ctx, registrations, calls }
 }
 
 const runSetup = async (name, ctx) => {
@@ -203,4 +213,30 @@ test("aggregator: index.js default registers all seven concerns", async () => {
     assert.ok(registrations["session:compaction"], "compaction")
     assert.equal(typeof cleanup, "function")
     await cleanup()
+})
+
+test("v2 promptAsync: noReply injects synthetic; a plain prompt starts a real turn", async () => {
+    const { ctx, calls } = makeCtx()
+    const { bridgeHooksV2 } = await import(new URL("../plugins/opencode-v2.js", import.meta.url))
+    let adapted
+    await bridgeHooksV2(ctx, [
+        async ({ client }) => {
+            adapted = client
+            return {}
+        },
+    ])
+    await adapted.session.promptAsync({
+        path: { id: "s1" },
+        body: { parts: [{ type: "text", text: "resume" }] },
+    })
+    await new Promise((r) => setTimeout(r, 0))
+    assert.deepEqual(calls.synthetic, [])
+    assert.deepEqual(calls.prompt.map((call) => call.text), ["resume"])
+
+    await adapted.session.promptAsync({
+        path: { id: "s1" },
+        body: { parts: [{ type: "text", text: "context" }], noReply: true },
+    })
+    assert.deepEqual(calls.synthetic.map((call) => call.text), ["context"])
+    assert.equal(calls.prompt.length, 1)
 })

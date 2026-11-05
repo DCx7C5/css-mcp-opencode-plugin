@@ -1,6 +1,7 @@
 /**
  * session.broadcast consumer — Python pushes {id, prompt}; transport prompts
- * every ACTIVE session (updated within the window) or one explicit sessionID.
+ * every RUNNING session (`session.active` / `session.status`) or one explicit
+ * sessionID, falling back to a recency window only for older SDKs.
  */
 import { test, before, after } from "node:test"
 import assert from "node:assert/strict"
@@ -23,6 +24,7 @@ const SESSIONS = [
 
 const delivered = []
 let brain
+let client
 let clientSocket = null
 const brainSend = (obj) => clientSocket?.write(JSON.stringify(obj) + "\n")
 const settle = (ms = 300) => new Promise((r) => setTimeout(r, ms))
@@ -48,7 +50,7 @@ before(async () => {
     brain.listen(sock)
     await once(brain, "listening")
 
-    const client = {
+    client = {
         session: {
             list: async () => ({ data: SESSIONS, error: undefined }),
             promptAsync: async ({ body, path }) => {
@@ -68,16 +70,44 @@ after(async () => {
     rmSync(dir, { recursive: true, force: true })
 })
 
-test("broadcast prompts every active session and skips the stale one", async () => {
+test("broadcast prompts every recently active session and skips the stale one", async () => {
+    delete client.session.active
+    delete client.session.status
     brainSend({ type: "push", channel: "session.broadcast", body: { id: "b1", prompt: "standup" } })
     await settle()
     assert.deepEqual(delivered.map((d) => d.sessionID).sort(), ["s-recent", "s-recent-2"])
-    assert.ok(delivered.every((d) => d.text === "standup" && d.synthetic === true))
+    assert.ok(delivered.every((d) => d.text === "standup" && d.synthetic === undefined))
 })
 
 test("a sessionID targets one session regardless of age", async () => {
+    delete client.session.active
+    delete client.session.status
     delivered.length = 0
     brainSend({ type: "push", channel: "session.broadcast", body: { id: "b2", prompt: "ping", sessionID: "s-stale" } })
     await settle()
-    assert.deepEqual(delivered, [{ text: "ping", sessionID: "s-stale", synthetic: true }])
+    assert.deepEqual(delivered, [{ text: "ping", sessionID: "s-stale", synthetic: undefined }])
+})
+
+test("session.active wins: only running sessions are prompted", async () => {
+    delivered.length = 0
+    delete client.session.status
+    client.session.active = async () => ({ data: { "s-live": { type: "running" } } })
+    brainSend({ type: "push", channel: "session.broadcast", body: { id: "b3", prompt: "resume" } })
+    await settle()
+    assert.deepEqual(delivered, [{ text: "resume", sessionID: "s-live", synthetic: undefined }])
+})
+
+test("session.status fallback: busy and retry sessions are prompted, idle is not", async () => {
+    delivered.length = 0
+    delete client.session.active
+    client.session.status = async () => ({
+        data: {
+            "s-busy": { type: "busy" },
+            "s-retry": { type: "retry", attempt: 1, message: "429", next: 0 },
+            "s-idle": { type: "idle" },
+        },
+    })
+    brainSend({ type: "push", channel: "session.broadcast", body: { id: "b4", prompt: "resume" } })
+    await settle()
+    assert.deepEqual(delivered.map((d) => d.sessionID).sort(), ["s-busy", "s-retry"])
 })

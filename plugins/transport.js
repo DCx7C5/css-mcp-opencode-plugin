@@ -745,26 +745,60 @@ const REPLY_PREFIX = {
     "permission.answer": PLUGIN_PREFIX.permission,
 }
 
-/**
- * Handle a push from the Python server. Push dispatch runs BEFORE orphan
- * matching in the pool data handler.
- * @param {string} channel
- * @param {object} body
- */
-/** Sessions updated within this window count as active for `session.broadcast`. */
+/** Sessions updated within this window count as active when the SDK exposes
+ * neither `session.active` nor `session.status`. */
 const BROADCAST_ACTIVE_MS = 30 * 60 * 1000
 
+/** v1 `SessionStatus` values that mean the session is engaged. */
+const RUNNING_STATUS = new Set(["busy", "retry"])
+
 /**
- * Prompt every active session — the `session.broadcast` push consumer.
+ * IDs the broadcast must reach.
+ *
+ * Prefers the runtime's own running set — `session.active` on v2
+ * (`{data: {sessionID: {type: "running"}}}`) or `session.status` on v1
+ * (`{data: {sessionID: {type: "busy"|"retry"|"idle"}}}`). The list + recency
+ * window is the last resort for an SDK that exposes neither.
+ *
+ * @param {object} client Active SDK-shaped client.
+ * @returns {Promise<string[]>}
+ */
+async function activeSessionIDs(client) {
+    if (typeof client.session.active === "function") {
+        const res = await client.session.active()
+        const data = res?.data ?? res
+        return data && typeof data === "object" && !Array.isArray(data) ? Object.keys(data) : []
+    }
+    if (typeof client.session.status === "function") {
+        const res = await client.session.status()
+        const data = res?.data ?? res
+        if (data && typeof data === "object" && !Array.isArray(data)) {
+            return Object.entries(data)
+                .filter(([, status]) => RUNNING_STATUS.has(status?.type))
+                .map(([sessionID]) => sessionID)
+        }
+        return []
+    }
+    const listed = await client.session.list()
+    const sessions = Array.isArray(listed?.data) ? listed.data : []
+    const now = Date.now()
+    return sessions
+        .filter((session) => now - (session?.time?.updated ?? 0) <= BROADCAST_ACTIVE_MS)
+        .map((session) => session.id)
+}
+
+/**
+ * Prompt every actively running session — the `session.broadcast` push consumer.
  *
  * Python only says "send this prompt"; which sessions exist and which are
- * active is decided here, from the live SDK list. A session is active when it
- * was updated within `BROADCAST_ACTIVE_MS`. `promptAsync` starts the agent if
+ * running is decided here, from the live SDK. The text is a plain user part
+ * (no `synthetic` flag): it must behave like the same text typed into the
+ * prompt window, not like hidden context. `promptAsync` starts the agent if
  * needed and returns immediately, so a busy session still receives the prompt
  * on its next turn rather than blocking the push handler.
  *
  * @param {string} id Push id (log correlation only; no reply is sent).
- * @param {string} prompt Text pushed into every active session.
+ * @param {string} prompt Text pushed into every running session.
  * @param {string|null} sessionID Optional single target.
  */
 async function broadcastPrompt(id, prompt, sessionID = null) {
@@ -774,19 +808,11 @@ async function broadcastPrompt(id, prompt, sessionID = null) {
         return
     }
     try {
-        let targets = []
-        if (sessionID) {
-            targets = [{ id: sessionID }]
-        } else {
-            const listed = await client.session.list()
-            const sessions = Array.isArray(listed?.data) ? listed.data : []
-            const now = Date.now()
-            targets = sessions.filter((session) => now - (session?.time?.updated ?? 0) <= BROADCAST_ACTIVE_MS)
-        }
-        for (const session of targets) {
+        const targets = sessionID ? [sessionID] : await activeSessionIDs(client)
+        for (const target of targets) {
             await client.session.promptAsync({
-                body: { parts: [{ type: "text", text: prompt, synthetic: true }] },
-                path: { id: session.id },
+                body: { parts: [{ type: "text", text: prompt }] },
+                path: { id: target },
             })
         }
         log.debug(`session.broadcast: id=${id.slice(0, 8)} sent=${targets.length}`)
@@ -795,6 +821,12 @@ async function broadcastPrompt(id, prompt, sessionID = null) {
     }
 }
 
+/**
+ * Handle a push from the Python server. Push dispatch runs BEFORE orphan
+ * matching in the pool data handler.
+ * @param {string} channel
+ * @param {object} body
+ */
 function handlePush(channel, body) {
     if (channel === "capabilities.update" && body && typeof body === "object") {
         bootstrap.caps = new Set(CAPABILITY_KEYS.filter((key) => body[key] === true))
