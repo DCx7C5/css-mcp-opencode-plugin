@@ -751,6 +751,50 @@ const REPLY_PREFIX = {
  * @param {string} channel
  * @param {object} body
  */
+/** Sessions updated within this window count as active for `session.broadcast`. */
+const BROADCAST_ACTIVE_MS = 30 * 60 * 1000
+
+/**
+ * Prompt every active session — the `session.broadcast` push consumer.
+ *
+ * Python only says "send this prompt"; which sessions exist and which are
+ * active is decided here, from the live SDK list. A session is active when it
+ * was updated within `BROADCAST_ACTIVE_MS`. `promptAsync` starts the agent if
+ * needed and returns immediately, so a busy session still receives the prompt
+ * on its next turn rather than blocking the push handler.
+ *
+ * @param {string} id Push id (log correlation only; no reply is sent).
+ * @param {string} prompt Text pushed into every active session.
+ * @param {string|null} sessionID Optional single target.
+ */
+async function broadcastPrompt(id, prompt, sessionID = null) {
+    const client = activeClient
+    if (!client) {
+        log.warn("session.broadcast: no active client")
+        return
+    }
+    try {
+        let targets = []
+        if (sessionID) {
+            targets = [{ id: sessionID }]
+        } else {
+            const listed = await client.session.list()
+            const sessions = Array.isArray(listed?.data) ? listed.data : []
+            const now = Date.now()
+            targets = sessions.filter((session) => now - (session?.time?.updated ?? 0) <= BROADCAST_ACTIVE_MS)
+        }
+        for (const session of targets) {
+            await client.session.promptAsync({
+                body: { parts: [{ type: "text", text: prompt, synthetic: true }] },
+                path: { id: session.id },
+            })
+        }
+        log.debug(`session.broadcast: id=${id.slice(0, 8)} sent=${targets.length}`)
+    } catch (err) {
+        log.error(`session.broadcast: ${err.message ?? String(err)}`)
+    }
+}
+
 function handlePush(channel, body) {
     if (channel === "capabilities.update" && body && typeof body === "object") {
         bootstrap.caps = new Set(CAPABILITY_KEYS.filter((key) => body[key] === true))
@@ -761,6 +805,14 @@ function handlePush(channel, body) {
     }
     if (channel === "session.inject" && body && typeof body === "object") {
         injector.push(body, activeClient)
+        return
+    }
+    if (channel === "session.broadcast" && body && typeof body === "object") {
+        if (typeof body.id === "string" && typeof body.prompt === "string") {
+            void broadcastPrompt(body.id, body.prompt, typeof body.sessionID === "string" ? body.sessionID : null)
+        } else {
+            log.error("session.broadcast: missing id/prompt, ignored")
+        }
         return
     }
     if (channel === "session.context.read" && body && typeof body === "object") {
