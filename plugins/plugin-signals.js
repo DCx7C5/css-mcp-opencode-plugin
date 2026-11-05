@@ -32,7 +32,12 @@ import {
 const SIGNALS = [
     {
         id: "free_messages_exhausted",
-        contains: "You've used today's free messages. They reset at",
+        // The wire error the provider layer raises on a 429 free-quota
+        // rejection. The TUI sentence ("You've used today's free messages…")
+        // is rendered client-side from retryAfterMs and never appears on the
+        // wire, so matching it could never fire.
+        contains: "Free usage limit reached",
+        errorTypes: ["provider.free-limit"],
     },
 ]
 
@@ -43,18 +48,17 @@ const COOLDOWN_MS = 10 * 60 * 1000
 const EXCERPT_MAX = 500
 
 /**
- * Events that can carry the pattern. `session.next.text.ended` is the normal
- * assistant-text surface; the rest cover provider errors and TUI messages.
- * `message.part.updated` is a fallback for runtimes that only emit parts —
- * it is restricted to completed, non-synthetic text parts so streamed deltas
- * cannot fire the signal repeatedly.
+ * Events that can carry the pattern — the runtime hook names, i.e. the
+ * `@opencode/protocol` event types. The SDK's `session.next.*` spelling is a
+ * client-stream alias and NEVER reaches the plugin `event` hook; do not
+ * reintroduce it. `session.text.ended` is the assistant-text surface, and the
+ * two failures carry `data.error` (`{type, message, status, response, …}`).
  */
 const WATCHED_EVENTS = new Set([
-    "session.next.text.ended",
-    "session.next.step.failed",
-    "session.error",
+    "session.text.ended",
+    "session.step.failed",
+    "session.execution.failed",
     "tui.toast.show",
-    "message.part.updated",
 ])
 
 /** Normalize typographic apostrophes and whitespace before matching. */
@@ -77,19 +81,13 @@ const propertiesOf = (event) => event?.properties ?? event?.data ?? {}
 /** Extract the candidate text for one watched event. */
 const eventText = (type, props) => {
     switch (type) {
-        case "session.next.text.ended":
+        case "session.text.ended":
             return asText(props.text)
-        case "session.next.step.failed":
-        case "session.error":
+        case "session.step.failed":
+        case "session.execution.failed":
             return asText(props.error)
         case "tui.toast.show":
             return [props.title, props.message].filter(Boolean).map(asText).join(" ")
-        case "message.part.updated": {
-            const part = props.part
-            if (!part || part.type !== "text" || part.synthetic || part.ignored) return ""
-            if (!part.time?.end) return ""
-            return asText(part.text)
-        }
         default:
             return ""
     }
@@ -103,12 +101,17 @@ export const server = async ({ client, directory: dir, worktree: wt, project }) 
     /** `${signal.id}:${sessionID}` → last send timestamp. */
     const lastSent = new Map()
 
-    /** First configured pattern contained in *text*, or null. */
-    const match = (text) => {
+    /** First configured pattern matched by *props* (structured) or *text*, or null. */
+    const match = (text, props) => {
+        const error = props?.error
+        const errorType = typeof error?.type === "string" ? error.type : ""
+        const errorStatus = typeof error?.status === "number" ? error.status : 0
         const haystack = normalize(text)
-        if (!haystack) return null
+
         for (const signal of SIGNALS) {
-            if (haystack.includes(normalize(signal.contains))) return signal
+            if (errorType && signal.errorTypes?.includes(errorType)) return signal
+            if (errorStatus === 429 && signal.errorTypes?.length) return signal
+            if (haystack && signal.contains && haystack.includes(normalize(signal.contains))) return signal
         }
         return null
     }
@@ -120,9 +123,8 @@ export const server = async ({ client, directory: dir, worktree: wt, project }) 
 
             const props = propertiesOf(event)
             const text = eventText(type, props)
-            if (!text) return
 
-            const signal = match(text)
+            const signal = match(text, props)
             if (!signal) return
 
             const sessionID = props.sessionID ?? props.part?.sessionID ?? ""
