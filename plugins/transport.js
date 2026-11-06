@@ -855,6 +855,45 @@ async function broadcastPrompt(id, prompt, sessionID = null) {
 }
 
 /**
+ * Abort the sessions Python names — the `session.abort` push consumer.
+ *
+ * Python decides *which* sessions must stop; this side only maps each id to
+ * one `client.session.abort` call. The body crosses the socket, so the list
+ * is treated as untrusted shape: only strings survive, and duplicates collapse
+ * to one abort. No reply is sent — abort is best-effort by nature, and a
+ * rejected SDK call is logged rather than thrown into the pool data handler.
+ *
+ * @param {string} id Push id (log correlation only; no reply is sent).
+ * @param {string[]} sessionIDs Session ids to abort.
+ * @returns {Promise<{sent: number}>} Number of abort calls that succeeded.
+ */
+async function abortSessions(id, sessionIDs) {
+    const client = activeClient
+    if (!client) {
+        log.warn("session.abort: no active client")
+        return { sent: 0 }
+    }
+    const targets = Array.isArray(sessionIDs)
+        ? [...new Set(sessionIDs.filter((sessionID) => typeof sessionID === "string"))]
+        : []
+    if (targets.length === 0) {
+        log.warn("session.abort: no session ids")
+        return { sent: 0 }
+    }
+    let sent = 0
+    try {
+        for (const target of targets) {
+            await client.session.abort({ path: { id: target } })
+            sent += 1
+        }
+        log.debug(`session.abort: id=${id.slice(0, 8)} sent=${targets.length}`)
+    } catch (err) {
+        log.error("session.abort: " + (err.message ?? String(err)))
+    }
+    return { sent }
+}
+
+/**
  * Handle a push from the Python server. Push dispatch runs BEFORE orphan
  * matching in the pool data handler.
  * @param {string} channel
@@ -877,6 +916,14 @@ function handlePush(channel, body) {
             void broadcastPrompt(body.id, body.prompt, typeof body.sessionID === "string" ? body.sessionID : null)
         } else {
             log.error("session.broadcast: missing id/prompt, ignored")
+        }
+        return
+    }
+    if (channel === "session.abort" && body && typeof body === "object") {
+        if (typeof body.id === "string" && Array.isArray(body.sessionIDs)) {
+            void abortSessions(body.id, body.sessionIDs)
+        } else {
+            log.error("session.abort: missing id/sessionIDs, ignored")
         }
         return
     }

@@ -278,29 +278,31 @@ object is already in the JS process); all action logic stays in Python. This is
 distinct from `plugin-events.js`: events are fire-and-forget observation, a
 signal is a rare action request.
 
-Detection is **structured only** — `event.error.type`, never a substring of
-event text. Assistant text (`session.text.ended`), toasts (`tui.toast.show`),
-user prompts and injected context can quote the error sentence verbatim; a text
-match would fire a reconnect on the client frontend's own words.
+Detection is **structured only** — the typed error's `error.type` **and**
+`error.status`, never a substring of event text. Assistant text
+(`session.text.ended`), toasts (`tui.toast.show`), user prompts and injected
+context can quote the error sentence verbatim; a text match would fire a
+reconnect on the client frontend's own words.
 
 Watched surfaces (the only two that carry `error`):
 
 | event | matcher |
 |-------|---------|
-| `session.step.failed` | `error.type` |
-| `session.execution.failed` | `error.type` |
+| `session.step.failed` | `error.type` + `error.status` |
+| `session.execution.failed` | `error.type` + `error.status` |
 
 Configured signal:
 
 ```json
-{ "id": "free_messages_exhausted", "errorTypes": ["provider.free-limit"] }
+{ "id": "free_messages_exhausted", "errorTypes": ["provider.free-limit"], "status": 429 }
 ```
 
-A bare `status: 429` is **not** a trigger: the provider layer already
-classifies the body, and a 429 from another cause must not borrow this
-signal's reconnect action. The cooldown is **one minute per signal/session**; the Python action registry keeps
-the authoritative global cooldown, so a plugin reload or a second connection
-cannot re-trigger the action. One minute, not ten: after a reconnect that left a
+Both fields are required: `error.type` alone can arrive on another status, and a
+bare `status: 429` can come from another cause — only the typed pair proves the
+backend condition this signal's reconnect action belongs to. The cooldown is
+**90 seconds per signal/session**; the Python action registry keeps the
+authoritative global cooldown, so a plugin reload or a second connection cannot
+re-trigger the action. Ninety, not ten minutes: after a reconnect that left a
 pre-reconnect TCP flow alive, the only useful retry window is the ~30 s that
 flow needs to idle out.
 
@@ -358,9 +360,10 @@ Push channels consumed by transport.js: `capabilities.update` (live cap
 re-apply + config), `session.inject` (live content injection via
 `client.session.promptAsync`, FIFO/dedupe/fail-safe), `session.context.read`
 (reverse-RPC above), `task.launch` (reverse-RPC above), `session.intel` and
-`session.summarize` (reverse-RPCs above), `permission.answer` (reverse-RPC
-above). `permissions.update` is informational — permission rules live in the
-Python brain, there is nothing to cache JS-side.
+`session.summarize` (reverse-RPCs above), `session.abort` (`{id, sessionIDs}`
+→ one `client.session.abort` per distinct id; no reply), `permission.answer`
+(reverse-RPC above). `permissions.update` is informational — permission rules
+live in the Python brain, there is nothing to cache JS-side.
 
 ---
 

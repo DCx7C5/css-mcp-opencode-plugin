@@ -3,11 +3,12 @@
  * op emitted by `plugins/plugin-signals.js`.
  *
  * The detector is STRUCTURED ONLY. Assertions:
- *  - a signal fires from the provider layer's typed error on the two error
- *    surfaces the runtime emits (`session.step.failed`,
- *    `session.execution.failed`);
- *  - assistant text, a TUI toast, the SDK `session.next.*` alias and a bare
- *    `status: 429` never fire — those are frontend or injected text, not the
+ *  - a signal fires from the provider layer's typed error — both `error.type`
+ *    and `error.status: 429` — on the two error surfaces the runtime emits
+ *    (`session.step.failed`, `session.execution.failed`);
+ *  - assistant text, a TUI toast, the SDK `session.next.*` alias, a bare
+ *    `status: 429`, the right type with another status and the right type with
+ *    no status never fire — those are frontend or injected text, not the
  *    client backend;
  *  - the 1-minute cooldown is per signal/session;
  *  - the op is sent on the `e:` prefix with the expected body and never
@@ -104,7 +105,7 @@ test("fires on the typed free-limit step failure", async () => {
     assert.equal(signalBodies[0].signal, "free_messages_exhausted")
     assert.equal(signalBodies[0].sessionID, "s1")
     assert.equal(signalBodies[0].messageID, "m1")
-    assert.equal(signalBodies[0].matched, "provider.free-limit")
+    assert.equal(signalBodies[0].matched, "provider.free-limit/429")
     assert.ok(signalBodies[0].excerpt.includes("provider.free-limit"))
     assert.equal(signalBodies[0].pid, process.pid, "the brain measures this process's flows")
 })
@@ -188,6 +189,36 @@ test("ignores an unrelated typed error", async () => {
     })
     await flushWait()
     assert.equal(signalBodies.length, 0)
+})
+
+test("ignores the typed error carrying a non-429 status", async () => {
+    signalBodies.length = 0
+    await signalsHook({
+        event: {
+            type: "session.step.failed",
+            data: {
+                sessionID: "s7b",
+                error: { type: "provider.free-limit", message: PHRASE, status: 500 },
+            },
+        },
+    })
+    await flushWait()
+    assert.equal(signalBodies.length, 0, "type alone is not enough — the 429 status is part of the signal")
+})
+
+test("ignores the typed error with no status", async () => {
+    signalBodies.length = 0
+    await signalsHook({
+        event: {
+            type: "session.step.failed",
+            data: {
+                sessionID: "s7c",
+                error: { type: "provider.free-limit", message: PHRASE },
+            },
+        },
+    })
+    await flushWait()
+    assert.equal(signalBodies.length, 0, "a missing status never matches a status-gated signal")
 })
 
 test("suppresses repeated matches in the same session", async () => {

@@ -5,7 +5,7 @@
  * decision/action logic stays in the Python brain.
  *
  * Detection is structured only: a signal is sent when the provider layer
- * raises its typed error (`error.type`), never when a sentence in assistant
+ * raises its typed error (`error.type` + `error.status`), never when a sentence in assistant
  * text, a user prompt, an injected context or a client-rendered toast happens
  * to contain the same words. Those surfaces run through the same event bus
  * and may quote the error verbatim; matching them would attribute the client
@@ -36,9 +36,10 @@ import {
 /**
  * Signals the plugin forwards. Each entry becomes one Python signal name.
  *
- * `errorTypes` is the whole matcher: the provider layer's typed error is the
- * only evidence that the backend — not a prompt, an assistant reply or an
- * injected context — produced the condition.
+ * `errorTypes` plus `status` are the whole matcher: the provider layer's
+ * typed error — both the type and the HTTP status — is the only evidence that
+ * the backend, not a prompt, an assistant reply or an injected context,
+ * produced the condition.
  */
 const SIGNALS = [
     {
@@ -48,18 +49,20 @@ const SIGNALS = [
         // messages…") is rendered client-side from retryAfterMs and never
         // appears on the wire, so it was never a usable trigger.
         errorTypes: ["provider.free-limit"],
+        status: 429,
     },
 ]
 
 /**
  * Per signal/session suppression window.
  *
- * One minute, not ten: after a WAN reconnect that did not take effect (the
- * client kept a pre-reconnect TCP flow), the only useful retry window is the
- * ~30 s the old flow needs to idle out. A ten-minute window suppressed that
- * retry entirely; a minute still stops a reconnect storm across sessions.
+ * Ninety seconds, not ten minutes: after a WAN reconnect that did not take
+ * effect (the client kept a pre-reconnect TCP flow), the only useful retry
+ * window is the ~30 s the old flow needs to idle out. A ten-minute window
+ * suppressed that retry entirely; ninety seconds still stops a reconnect
+ * storm across sessions.
  */
-const COOLDOWN_MS = 60 * 1000
+const COOLDOWN_MS = 90 * 1000
 
 /** Upper bound on the matched text shipped over the socket. */
 const EXCERPT_MAX = 500
@@ -113,20 +116,21 @@ export const server = async ({ client, directory: dir, worktree: wt, project }) 
     const lastSent = new Map()
 
     /**
-     * First signal whose structured error type matches *props*, or null.
+     * First signal whose structured error matches *props*, or null.
      *
-     * Only `props.error.type` is consulted. A blank `type` never matches, and
-     * a bare `status: 429` is not enough: the provider layer already classifies
-     * the body, and a 429 from another cause must not borrow this signal's
-     * reconnect action.
+     * Both `props.error.type` and `props.error.status` are required: the type
+     * alone can arrive on another status, and a bare `status: 429` can come
+     * from another cause — only the typed pair proves the backend condition
+     * this signal's action belongs to.
      */
     const match = (props) => {
         const error = props?.error
         const errorType = typeof error?.type === "string" ? error.type : ""
-        if (!errorType) return null
+        const errorStatus = typeof error?.status === "number" ? error.status : null
+        if (!errorType || errorStatus === null) return null
 
         for (const signal of SIGNALS) {
-            if (signal.errorTypes?.includes(errorType)) return signal
+            if (signal.status === errorStatus && signal.errorTypes?.includes(errorType)) return signal
         }
         return null
     }
@@ -138,6 +142,9 @@ export const server = async ({ client, directory: dir, worktree: wt, project }) 
 
             const props = propertiesOf(event)
             const text = eventText(type, props)
+            const errorType = typeof props?.error?.type === "string" ? props.error.type : ""
+            const errorStatus = typeof props?.error?.status === "number" ? props.error.status : ""
+            const matched = `${errorType}/${errorStatus}`
 
             const signal = match(props)
             if (!signal) return
@@ -148,19 +155,19 @@ export const server = async ({ client, directory: dir, worktree: wt, project }) 
             const now = Date.now()
             const last = lastSent.get(key) ?? 0
             if (now - last < COOLDOWN_MS) {
-                log(`signal: ${signal.id} suppressed (cooldown, session=${sessionID || "unknown"})`)
+                log(`signal: ${signal.id} suppressed (cooldown, ${matched}, session=${sessionID || "unknown"})`)
                 return
             }
             lastSent.set(key, now)
 
-            log(`signal: ${signal.id} matched in ${type} session=${sessionID || "unknown"}`)
+            log(`signal: ${signal.id} matched ${matched} in ${type} session=${sessionID || "unknown"}`)
             rpc(
                 "signal",
                 {
                     signal: signal.id,
                     sessionID: sessionID || null,
                     messageID,
-                    matched: typeof props?.error?.type === "string" ? props.error.type : "",
+                    matched,
                     excerpt: text.slice(0, EXCERPT_MAX),
                     at: now,
                     directory: directory() ?? dir,
