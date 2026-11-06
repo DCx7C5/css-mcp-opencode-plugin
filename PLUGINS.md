@@ -1,10 +1,11 @@
 # Plugins — feature reference
 
-This repo ships **seven per-concern plugins** plus a shared transport. Each plugin
-registers only its own hook surface; they all import the `plugins/transport.js` ESM
-singleton, so every plugin in a process shares **one** socket, **one** bootstrap
-handshake, and **one** capability gate — loading one plugin or all seven is
-functionally identical.
+This repo ships **seven per-concern server plugins** plus a shared transport, and a
+**TUI part** (`plugins/tui.js`, exported as `./tui`) that republishes the client tab
+strip. Each server plugin registers only its own hook surface; they all import the
+`plugins/transport.js` ESM singleton, so every plugin in a process shares **one**
+socket, **one** bootstrap handshake, and **one** capability gate — loading one plugin
+or all seven is functionally identical.
 
 | plugin | file | hook surface | authority |
 |--------|------|--------------|-----------|
@@ -34,6 +35,7 @@ plugin a hook line came from, which it cannot tell from the JSON alone.
 | `c:` | plugin-context | `context` (compacting + context syncs) |
 | `e:` | plugin-events | `event.pipeline`, fire-and-forget `event` |
 | `e:` | plugin-signals | `signal` (rare, action-request RPC) |
+| `e:` | plugin-tui | `tabs` (TUI-only tab snapshot; fire-and-forget) |
 | `s:` | plugin-secrets | **never** — the hardblock is local-only, no socket bytes |
 
 Bridge-level ops (`bootstrap`, `config`) and every Py→JS line are unprefixed.
@@ -323,13 +325,49 @@ because Bun keeps its fetch pool internal.
 
 `tabs` mirrors the client's open-tab strip (`ctx.tabs.list()`: `key`, the tab's
 session id or `null` for a draft, and the active flag). It exists on the window
-(GUI) plugin context only — the server plugin context this package loads into
-has no tab strip — so on the current loader the field is always present and
-usually `[]`; consumers must treat it as best-effort metadata.
+(GUI) and TUI plugin contexts only — the server plugin context this package
+loads into has no tab strip — so the signal's field is usually `[]`; consumers
+must treat it as best-effort metadata. The TUI part below republishes the same
+strip over the dedicated `tabs` op.
 
 Python replies `{accepted: boolean, signal, action?, dispatched?, deduped?, reason?}`.
 An older brain without the op replies `ok:false` (unknown op); the plugin logs it
 at debug and continues forwarding events.
+
+---
+
+## plugins/tui.js — TUI tab-strip producer (`./tui`)
+
+The TUI is the only opencode plugin context with a tab strip; the server context
+that loads `plugins/index.js` cannot see open tabs. This part therefore lives in
+`package.json` `exports["./tui"]` and runs in the TUI process, sending a snapshot
+over the same bridge:
+
+- once at setup;
+- on `session.execution.failed` and `session.step.failed`;
+- every 15 s (`TABS_INTERVAL_MS`).
+
+Wire body (`e:tabs`, `wait:false`):
+
+```json
+{ "tabs": [{ "key": null, "sessionID": "ses_…", "active": true }],
+  "at": 1730000000000 }
+```
+
+The 2.2.5 TUI exposes tabs as `{sessionID, title, active, busy, attention,
+unread}`; the GUI window context exposes `{key, session: {id} | undefined,
+active}`. Both normalize to `{key, sessionID, active}`: a draft tab keeps
+`sessionID: null` and a TUI tab (no window key) keeps `key: null`. When
+`ui.tabs.enabled()` is false the body is `{tabs: []}`; a missing `ui.tabs`, a
+throwing `list()`/`enabled()`, or a non-array result suppresses the send
+entirely. Transport failures are swallowed — the TUI part is metadata only and
+never blocks or breaks a session.
+
+`plugins/tui.js` only calls `Plugin.define(...)`; the definition and payload
+builder live in `plugins/tui-tabs.js` so `node --test` can exercise them without
+the runtime-only `@opencode/plugin/tui` package. A real TUI run (opencode 2.2.5,
+`plugins: ["<repo-dir>"]`) resolved `./tui`, ran setup, and emitted both the
+empty setup snapshot and a populated 15 s snapshot with a live `sessionID`.
 
 ---
 
@@ -468,5 +506,8 @@ uv run --group test pytest   # scripts/client.py smoke tests
   provider errors, TUI toasts, and completed text parts (`properties` and
   durable `data`); synthetic/streaming parts ignored; 1-minute per-session
   cooldown; `e:signal` body shape and reply handling.
+- `tests/plugins.tui.test.mjs` — TUI tab payload from both runtime shapes
+  (2.2.5 `sessionID` and GUI `key`/`session.id`), drafts, disabled/missing/
+  throwing strips, `e:tabs` body/options, event triggers and cleanup.
 - `tests/test_client.py` — `strip_plugin_prefix` unit tests (serve/stream
   decode paths in `scripts/client.py`).
