@@ -41,8 +41,15 @@ const SIGNALS = [
     },
 ]
 
-/** Per signal/session suppression window. */
-const COOLDOWN_MS = 10 * 60 * 1000
+/**
+ * Per signal/session suppression window.
+ *
+ * One minute, not ten: after a WAN reconnect that did not take effect (the
+ * client kept a pre-reconnect TCP flow), the only useful retry window is the
+ * ~30 s the old flow needs to idle out. A ten-minute window suppressed that
+ * retry entirely; a minute still stops a reconnect storm across sessions.
+ */
+const COOLDOWN_MS = 60 * 1000
 
 /** Upper bound on the matched text shipped over the socket. */
 const EXCERPT_MAX = 500

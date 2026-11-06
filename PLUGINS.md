@@ -445,7 +445,7 @@ uv run --group test pytest   # scripts/client.py smoke tests
   stay unprefixed, and reverse-RPC replies carry `c:`/`t:`/`p:`.
 - `tests/plugins.signals.test.mjs` — pattern detection on assistant text,
   provider errors, TUI toasts, and completed text parts (`properties` and
-  durable `data`); synthetic/streaming parts ignored; 10-minute per-session
+  durable `data`); synthetic/streaming parts ignored; 1-minute per-session
   cooldown; `e:signal` body shape and reply handling.
 - `tests/test_client.py` — `strip_plugin_prefix` unit tests (serve/stream
   decode paths in `scripts/client.py`).

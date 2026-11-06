@@ -9,7 +9,7 @@
  *  - the real 429 payload (`error.type = provider.free-limit`) matches, even
  *    when the textual phrase is absent — the TUI sentence is client-rendered
  *    and never appears on the wire;
- *  - the 10-minute cooldown is per signal/session;
+ *  - the 1-minute cooldown is per signal/session;
  *  - the op is sent on the `e:` prefix with the expected body and never
  *    waits for the brain reply.
  */
@@ -180,7 +180,7 @@ test("suppresses repeated matches in the same session", async () => {
     await flushWait()
     await signalsHook({ event })
     await flushWait()
-    assert.equal(signalBodies.length, 1, "the 10-minute cooldown must suppress the second match")
+    assert.equal(signalBodies.length, 1, "the 1-minute cooldown must suppress the second match")
 })
 
 test("a different session is not suppressed", async () => {
