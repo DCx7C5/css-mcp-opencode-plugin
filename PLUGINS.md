@@ -311,6 +311,7 @@ the brain):
 
 ```json
 { "signal": "free_messages_exhausted", "sessionID": "…", "messageID": "…",
+  "tabs": [{ "key": "…", "sessionID": "…", "active": true }],
   "matched": "…", "excerpt": "…≤500 chars…", "at": 1730000000000, "directory": "…",
   "pid": 48213 }
 ```
@@ -319,6 +320,12 @@ the brain):
 live public flows with `psutil` before and after a WAN reconnect, so it can prove
 the new address is actually in use; the socket list cannot come from the plugin,
 because Bun keeps its fetch pool internal.
+
+`tabs` mirrors the client's open-tab strip (`ctx.tabs.list()`: `key`, the tab's
+session id or `null` for a draft, and the active flag). It exists on the window
+(GUI) plugin context only — the server plugin context this package loads into
+has no tab strip — so on the current loader the field is always present and
+usually `[]`; consumers must treat it as best-effort metadata.
 
 Python replies `{accepted: boolean, signal, action?, dispatched?, deduped?, reason?}`.
 An older brain without the op replies `ok:false` (unknown op); the plugin logs it

@@ -107,6 +107,7 @@ test("fires on the typed free-limit step failure", async () => {
     assert.equal(signalBodies[0].messageID, "m1")
     assert.equal(signalBodies[0].matched, "provider.free-limit/429")
     assert.ok(signalBodies[0].excerpt.includes("provider.free-limit"))
+    assert.deepEqual(signalBodies[0].tabs, [], "no tab domain outside the window context")
     assert.equal(signalBodies[0].pid, process.pid, "the brain measures this process's flows")
 })
 
@@ -245,4 +246,55 @@ test("a different session is not suppressed", async () => {
     await flushWait()
     assert.equal(signalBodies.length, 1)
     assert.equal(signalBodies[0].sessionID, "s9b")
+})
+
+test("carries the client's open tabs, including a session-less draft", async () => {
+    const { server } = await import("../plugins/plugin-signals.js")
+    const tabsHook = (
+        await server({
+            client: {},
+            tabs: {
+                list: () => [
+                    { key: "tab-1", session: { id: "s-tab" }, active: true },
+                    { key: "draft-1", session: undefined, active: false },
+                ],
+            },
+        })
+    ).event
+    signalBodies.length = 0
+    await tabsHook({
+        event: { type: "session.step.failed", data: { sessionID: "s-tab", error: FREE_LIMIT_ERROR } },
+    })
+    await flushWait()
+    assert.equal(signalBodies.length, 1)
+    assert.deepEqual(signalBodies[0].tabs, [
+        { key: "tab-1", sessionID: "s-tab", active: true },
+        { key: "draft-1", sessionID: null, active: false },
+    ])
+})
+
+test("an empty or broken tab strip yields an empty list, never a throw", async () => {
+    const { server } = await import("../plugins/plugin-signals.js")
+    const emptyHook = (await server({ client: {}, tabs: { list: () => [] } })).event
+    const brokenHook = (
+        await server({
+            client: {},
+            tabs: {
+                list: () => {
+                    throw new Error("tab strip unavailable")
+                },
+            },
+        })
+    ).event
+    signalBodies.length = 0
+    await emptyHook({
+        event: { type: "session.step.failed", data: { sessionID: "s-empty", error: FREE_LIMIT_ERROR } },
+    })
+    await brokenHook({
+        event: { type: "session.step.failed", data: { sessionID: "s-broken", error: FREE_LIMIT_ERROR } },
+    })
+    await flushWait()
+    assert.equal(signalBodies.length, 2)
+    assert.deepEqual(signalBodies[0].tabs, [])
+    assert.deepEqual(signalBodies[1].tabs, [])
 })

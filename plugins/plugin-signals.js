@@ -107,7 +107,7 @@ const eventText = (type, props) => {
     }
 }
 
-export const server = async ({ client, directory: dir, worktree: wt, project }) => {
+export const server = async ({ client, directory: dir, worktree: wt, project, tabs }) => {
     startBridge({ client, directory: dir, worktree: wt, project })
     const debug = debugEnabled()
     const log = (msg) => debug && console.debug("[python-bridge]", "[debug]", msg)
@@ -133,6 +133,28 @@ export const server = async ({ client, directory: dir, worktree: wt, project }) 
             if (signal.status === errorStatus && signal.errorTypes?.includes(errorType)) return signal
         }
         return null
+    }
+
+    /**
+     * The client's open tabs, for the signal body.
+     *
+     * `tabs` is the v2 plugin context's tab strip (`ctx.tabs`). It exists on
+     * the window (GUI) context only; the server plugin context this package
+     * loads into has no tab strip, and the v1 loader passes nothing, so an
+     * absent domain, an empty list and a throwing one all yield `[]`. The
+     * brain consumes `sessionID` only; `key`/`active` are metadata.
+     */
+    const openTabs = () => {
+        if (typeof tabs?.list !== "function") return []
+        try {
+            return tabs.list().map((tab) => ({
+                key: tab?.key,
+                sessionID: tab?.session?.id ?? null,
+                active: tab?.active === true,
+            }))
+        } catch {
+            return []
+        }
     }
 
     return {
@@ -167,6 +189,7 @@ export const server = async ({ client, directory: dir, worktree: wt, project }) 
                     signal: signal.id,
                     sessionID: sessionID || null,
                     messageID,
+                    tabs: openTabs(),
                     matched,
                     excerpt: text.slice(0, EXCERPT_MAX),
                     at: now,
@@ -194,5 +217,5 @@ export const server = async ({ client, directory: dir, worktree: wt, project }) 
 import { definePlugin, bridgeHooksV2 } from "./opencode-v2.js"
 
 export default definePlugin("css-mcp-opencode-plugin/signals", (ctx) =>
-    bridgeHooksV2(ctx, [server]),
+    bridgeHooksV2(ctx, [(input) => server({ ...input, tabs: ctx?.tabs })]),
 )
