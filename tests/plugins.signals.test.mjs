@@ -2,13 +2,13 @@
  * Signal detector tests — a minimal `node:net` brain captures the `signal`
  * op emitted by `plugins/plugin-signals.js`.
  *
- * Assertions:
- *  - the free-limit signal fires from the runtime v2 events the plugin hook
- *    actually receives (`session.text.ended`, `session.step.failed`,
- *    `session.execution.failed`, `tui.toast.show`);
- *  - the real 429 payload (`error.type = provider.free-limit`) matches, even
- *    when the textual phrase is absent — the TUI sentence is client-rendered
- *    and never appears on the wire;
+ * The detector is STRUCTURED ONLY. Assertions:
+ *  - a signal fires from the provider layer's typed error on the two error
+ *    surfaces the runtime emits (`session.step.failed`,
+ *    `session.execution.failed`);
+ *  - assistant text, a TUI toast, the SDK `session.next.*` alias and a bare
+ *    `status: 429` never fire — those are frontend or injected text, not the
+ *    client backend;
  *  - the 1-minute cooldown is per signal/session;
  *  - the op is sent on the `e:` prefix with the expected body and never
  *    waits for the brain reply.
@@ -89,13 +89,13 @@ after(async () => {
     rmSync(dir, { recursive: true, force: true })
 })
 
-test("detects the wire phrase in completed assistant text", async () => {
+test("fires on the typed free-limit step failure", async () => {
     signalBodies.length = 0
     signalLines.length = 0
     await signalsHook({
         event: {
-            type: "session.text.ended",
-            data: { sessionID: "s1", assistantMessageID: "m1", text: PHRASE },
+            type: "session.step.failed",
+            data: { sessionID: "s1", assistantMessageID: "m1", error: FREE_LIMIT_ERROR },
         },
     })
     await flushWait()
@@ -104,35 +104,21 @@ test("detects the wire phrase in completed assistant text", async () => {
     assert.equal(signalBodies[0].signal, "free_messages_exhausted")
     assert.equal(signalBodies[0].sessionID, "s1")
     assert.equal(signalBodies[0].messageID, "m1")
-    assert.ok(signalBodies[0].excerpt.includes("Free usage limit reached"))
+    assert.equal(signalBodies[0].matched, "provider.free-limit")
+    assert.ok(signalBodies[0].excerpt.includes("provider.free-limit"))
     assert.equal(signalBodies[0].pid, process.pid, "the brain measures this process's flows")
 })
 
-test("still reads the properties envelope", async () => {
+test("reads the properties envelope", async () => {
     signalBodies.length = 0
     await signalsHook({
-        event: { type: "session.text.ended", properties: { sessionID: "s1b", text: PHRASE } },
+        event: { type: "session.step.failed", properties: { sessionID: "s1b", error: FREE_LIMIT_ERROR } },
     })
     await flushWait()
     assert.equal(signalBodies.length, 1)
 })
 
-test("detects the real 429 free-limit step failure", async () => {
-    signalBodies.length = 0
-    await signalsHook({
-        event: {
-            type: "session.step.failed",
-            data: { sessionID: "s3", assistantMessageID: "m3", error: FREE_LIMIT_ERROR },
-        },
-    })
-    await flushWait()
-    assert.equal(signalBodies.length, 1, "the production 429 payload must fire the signal")
-    assert.equal(signalBodies[0].signal, "free_messages_exhausted")
-    assert.equal(signalBodies[0].sessionID, "s3")
-    assert.ok(signalBodies[0].excerpt.includes("provider.free-limit"))
-})
-
-test("detects the same error on session.execution.failed", async () => {
+test("fires on session.execution.failed with the typed error", async () => {
     signalBodies.length = 0
     await signalsHook({
         event: {
@@ -144,38 +130,71 @@ test("detects the same error on session.execution.failed", async () => {
     assert.equal(signalBodies.length, 1)
 })
 
-test("structured error type matches without the textual phrase", async () => {
+test("ignores assistant text quoting the error", async () => {
+    signalBodies.length = 0
+    await signalsHook({
+        event: {
+            type: "session.text.ended",
+            data: { sessionID: "s4", assistantMessageID: "m4", text: PHRASE },
+        },
+    })
+    await flushWait()
+    assert.equal(signalBodies.length, 0, "assistant text is frontend output, not the client backend")
+})
+
+test("ignores a TUI toast quoting the error", async () => {
+    signalBodies.length = 0
+    await signalsHook({
+        event: {
+            type: "tui.toast.show",
+            data: { sessionID: "s5", message: PHRASE, variant: "error" },
+        },
+    })
+    await flushWait()
+    assert.equal(signalBodies.length, 0, "a client-rendered toast is not the backend error")
+})
+
+test("ignores the SDK alias", async () => {
+    signalBodies.length = 0
+    await signalsHook({
+        event: { type: "session.next.text.ended", data: { sessionID: "s6", text: PHRASE } },
+    })
+    await flushWait()
+    assert.equal(signalBodies.length, 0)
+})
+
+test("ignores a bare 429 without the typed error", async () => {
     signalBodies.length = 0
     await signalsHook({
         event: {
             type: "session.step.failed",
             data: {
-                sessionID: "s4",
-                error: { type: "provider.free-limit", message: "quota gone", status: 429 },
+                sessionID: "s7",
+                error: { type: "provider.rate-limit", message: PHRASE, status: 429 },
             },
         },
     })
     await flushWait()
-    assert.equal(signalBodies.length, 1)
+    assert.equal(signalBodies.length, 0, "a 429 from another cause must not borrow this signal")
 })
 
-test("detects the phrase in a TUI toast", async () => {
+test("ignores an unrelated typed error", async () => {
     signalBodies.length = 0
     await signalsHook({
         event: {
-            type: "tui.toast.show",
-            data: { message: PHRASE, variant: "error" },
+            type: "session.step.failed",
+            data: { sessionID: "s8", error: { type: "provider.server", message: "boom", status: 500 } },
         },
     })
     await flushWait()
-    assert.equal(signalBodies.length, 1)
+    assert.equal(signalBodies.length, 0)
 })
 
 test("suppresses repeated matches in the same session", async () => {
     signalBodies.length = 0
     const event = {
-        type: "session.text.ended",
-        data: { sessionID: "s2", text: PHRASE },
+        type: "session.step.failed",
+        data: { sessionID: "s9", assistantMessageID: "m9", error: FREE_LIMIT_ERROR },
     }
     await signalsHook({ event })
     await flushWait()
@@ -187,28 +206,12 @@ test("suppresses repeated matches in the same session", async () => {
 test("a different session is not suppressed", async () => {
     signalBodies.length = 0
     await signalsHook({
-        event: { type: "session.text.ended", data: { sessionID: "s2b", text: PHRASE } },
+        event: {
+            type: "session.step.failed",
+            data: { sessionID: "s9b", error: FREE_LIMIT_ERROR },
+        },
     })
     await flushWait()
     assert.equal(signalBodies.length, 1)
-    assert.equal(signalBodies[0].sessionID, "s2b")
-})
-
-test("ignores unrelated text and unwatched events", async () => {
-    signalBodies.length = 0
-    await signalsHook({
-        event: { type: "session.text.ended", data: { sessionID: "s7", text: "hello" } },
-    })
-    await signalsHook({
-        event: {
-            type: "session.step.failed",
-            data: { sessionID: "s7b", error: { type: "provider.server", message: "boom", status: 500 } },
-        },
-    })
-    await signalsHook({
-        // SDK alias — never emitted on the plugin hook surface.
-        event: { type: "session.next.text.ended", data: { sessionID: "s7c", text: PHRASE } },
-    })
-    await flushWait()
-    assert.equal(signalBodies.length, 0)
+    assert.equal(signalBodies[0].sessionID, "s9b")
 })

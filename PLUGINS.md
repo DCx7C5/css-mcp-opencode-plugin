@@ -270,32 +270,35 @@ Tracked event list lives in `transport.js` (`TRACKED_EVENTS` +
 
 ---
 
-## plugin-signals.js — pattern detector
+## plugin-signals.js — structured-error detector
 
-Watches the same event bus locally and emits one `signal` RPC when a configured
-phrase matches. Detection stays in the plugin (the event text is already in the
-JS process); all action logic stays in Python. This is distinct from
-`plugin-events.js`: events are fire-and-forget observation, a signal is a rare
-action request.
+Watches the same event bus locally and emits one `signal` RPC when the provider
+layer raises a configured typed error. Detection stays in the plugin (the error
+object is already in the JS process); all action logic stays in Python. This is
+distinct from `plugin-events.js`: events are fire-and-forget observation, a
+signal is a rare action request.
 
-Watched surfaces:
+Detection is **structured only** — `event.error.type`, never a substring of
+event text. Assistant text (`session.text.ended`), toasts (`tui.toast.show`),
+user prompts and injected context can quote the error sentence verbatim; a text
+match would fire a reconnect on the client frontend's own words.
 
-| event | text extracted |
-|-------|----------------|
-| `session.next.text.ended` | `properties.text` (normal assistant text) |
-| `session.error` | `properties.error` (stringified provider error) |
-| `session.next.step.failed` | `properties.error` |
-| `tui.toast.show` | `title` + `message` |
-| `message.part.updated` | completed, non-synthetic `text` parts only (fallback for runtimes that emit parts without `session.next.*`) |
+Watched surfaces (the only two that carry `error`):
 
-Default pattern:
+| event | matcher |
+|-------|---------|
+| `session.step.failed` | `error.type` |
+| `session.execution.failed` | `error.type` |
+
+Configured signal:
 
 ```json
-{ "id": "free_messages_exhausted", "contains": "You've used today's free messages. They reset at" }
+{ "id": "free_messages_exhausted", "errorTypes": ["provider.free-limit"] }
 ```
 
-Matching normalizes typographic apostrophes and runs of whitespace. The
-cooldown is **one minute per signal/session**; the Python action registry keeps
+A bare `status: 429` is **not** a trigger: the provider layer already
+classifies the body, and a 429 from another cause must not borrow this
+signal's reconnect action. The cooldown is **one minute per signal/session**; the Python action registry keeps
 the authoritative global cooldown, so a plugin reload or a second connection
 cannot re-trigger the action. One minute, not ten: after a reconnect that left a
 pre-reconnect TCP flow alive, the only useful retry window is the ~30 s that

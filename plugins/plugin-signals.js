@@ -4,11 +4,16 @@
  * transport concern: the pattern list and the cooldown live here, all
  * decision/action logic stays in the Python brain.
  *
+ * Detection is structured only: a signal is sent when the provider layer
+ * raises its typed error (`error.type`), never when a sentence in assistant
+ * text, a user prompt, an injected context or a client-rendered toast happens
+ * to contain the same words. Those surfaces run through the same event bus
+ * and may quote the error verbatim; matching them would attribute the client
+ * frontend's text to the client backend.
+ *
  * Why a dedicated op instead of `event`: the event stream is fire-and-forget
- * and unbounded, and `session.next.text.ended` is not in the plugin's
- * hookable set, so a Python hook cannot see it. A `signal` is a rare,
- * actionable observation and gets its own request/reply op on the existing
- * events prefix (`e:`).
+ * and unbounded, and a signal is a rare, actionable observation, so it gets
+ * its own request/reply op on the existing events prefix (`e:`).
  *
  * Reply expectation: sent with `wait: false` — the event loop never waits
  * for the brain. The reply (or an unknown-op error from an older brain) is
@@ -28,15 +33,20 @@ import {
     debugEnabled,
 } from "./transport.js"
 
-/** Patterns the plugin forwards. Each entry becomes one Python signal name. */
+/**
+ * Signals the plugin forwards. Each entry becomes one Python signal name.
+ *
+ * `errorTypes` is the whole matcher: the provider layer's typed error is the
+ * only evidence that the backend — not a prompt, an assistant reply or an
+ * injected context — produced the condition.
+ */
 const SIGNALS = [
     {
         id: "free_messages_exhausted",
-        // The wire error the provider layer raises on a 429 free-quota
-        // rejection. The TUI sentence ("You've used today's free messages…")
-        // is rendered client-side from retryAfterMs and never appears on the
-        // wire, so matching it could never fire.
-        contains: "Free usage limit reached",
+        // The type the provider layer assigns when the backend's 429 body is
+        // `FreeUsageLimitError`. The TUI sentence ("You've used today's free
+        // messages…") is rendered client-side from retryAfterMs and never
+        // appears on the wire, so it was never a usable trigger.
         errorTypes: ["provider.free-limit"],
     },
 ]
@@ -55,21 +65,19 @@ const COOLDOWN_MS = 60 * 1000
 const EXCERPT_MAX = 500
 
 /**
- * Events that can carry the pattern — the runtime hook names, i.e. the
- * `@opencode/protocol` event types. The SDK's `session.next.*` spelling is a
- * client-stream alias and NEVER reaches the plugin `event` hook; do not
- * reintroduce it. `session.text.ended` is the assistant-text surface, and the
- * two failures carry `data.error` (`{type, message, status, response, …}`).
+ * The only surfaces that carry the provider's structured error — the runtime
+ * hook names, i.e. the `@opencode/protocol` event types.
+ *
+ * `session.text.ended` (assistant text) and `tui.toast.show` are deliberately
+ * absent: both can echo the error sentence from a user prompt, an assistant
+ * reply or an injected context, and a signal must only ever come from the
+ * client backend. The SDK's `session.next.*` spelling is a client-stream
+ * alias and NEVER reaches the plugin `event` hook; do not reintroduce it.
  */
 const WATCHED_EVENTS = new Set([
-    "session.text.ended",
     "session.step.failed",
     "session.execution.failed",
-    "tui.toast.show",
 ])
-
-/** Normalize typographic apostrophes and whitespace before matching. */
-const normalize = (text) => text.replace(/[\u2018\u2019]/g, "'").replace(/\s+/g, " ").trim()
 
 /** Coerce an arbitrary event value to text without throwing on cycles. */
 const asText = (value) => {
@@ -85,16 +93,12 @@ const asText = (value) => {
 /** v2 events carry `properties`; the durable variant carries `data`. */
 const propertiesOf = (event) => event?.properties ?? event?.data ?? {}
 
-/** Extract the candidate text for one watched event. */
+/** The error object of one watched event, as text (the signal excerpt). */
 const eventText = (type, props) => {
     switch (type) {
-        case "session.text.ended":
-            return asText(props.text)
         case "session.step.failed":
         case "session.execution.failed":
             return asText(props.error)
-        case "tui.toast.show":
-            return [props.title, props.message].filter(Boolean).map(asText).join(" ")
         default:
             return ""
     }
@@ -108,17 +112,21 @@ export const server = async ({ client, directory: dir, worktree: wt, project }) 
     /** `${signal.id}:${sessionID}` → last send timestamp. */
     const lastSent = new Map()
 
-    /** First configured pattern matched by *props* (structured) or *text*, or null. */
-    const match = (text, props) => {
+    /**
+     * First signal whose structured error type matches *props*, or null.
+     *
+     * Only `props.error.type` is consulted. A blank `type` never matches, and
+     * a bare `status: 429` is not enough: the provider layer already classifies
+     * the body, and a 429 from another cause must not borrow this signal's
+     * reconnect action.
+     */
+    const match = (props) => {
         const error = props?.error
         const errorType = typeof error?.type === "string" ? error.type : ""
-        const errorStatus = typeof error?.status === "number" ? error.status : 0
-        const haystack = normalize(text)
+        if (!errorType) return null
 
         for (const signal of SIGNALS) {
-            if (errorType && signal.errorTypes?.includes(errorType)) return signal
-            if (errorStatus === 429 && signal.errorTypes?.length) return signal
-            if (haystack && signal.contains && haystack.includes(normalize(signal.contains))) return signal
+            if (signal.errorTypes?.includes(errorType)) return signal
         }
         return null
     }
@@ -131,7 +139,7 @@ export const server = async ({ client, directory: dir, worktree: wt, project }) 
             const props = propertiesOf(event)
             const text = eventText(type, props)
 
-            const signal = match(text, props)
+            const signal = match(props)
             if (!signal) return
 
             const sessionID = props.sessionID ?? props.part?.sessionID ?? ""
@@ -152,7 +160,7 @@ export const server = async ({ client, directory: dir, worktree: wt, project }) 
                     signal: signal.id,
                     sessionID: sessionID || null,
                     messageID,
-                    matched: signal.contains,
+                    matched: typeof props?.error?.type === "string" ? props.error.type : "",
                     excerpt: text.slice(0, EXCERPT_MAX),
                     at: now,
                     directory: directory() ?? dir,
