@@ -105,6 +105,7 @@ test("detects the wire phrase in completed assistant text", async () => {
     assert.equal(signalBodies[0].sessionID, "s1")
     assert.equal(signalBodies[0].messageID, "m1")
     assert.ok(signalBodies[0].excerpt.includes("Free usage limit reached"))
+    assert.equal(signalBodies[0].pid, process.pid, "the brain measures this process's flows")
 })
 
 test("still reads the properties envelope", async () => {

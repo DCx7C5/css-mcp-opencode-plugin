@@ -14,7 +14,7 @@
  * for the brain. The reply (or an unknown-op error from an older brain) is
  * matched by the durable pending map and ignored on timeout.
  *
- * Cooldown: 10 minutes per signal/session. The Python action registry keeps
+ * Cooldown: one minute per signal/session. The Python action registry keeps
  * the authoritative global cooldown; this one only avoids socket spam.
  */
 
@@ -156,6 +156,12 @@ export const server = async ({ client, directory: dir, worktree: wt, project }) 
                     excerpt: text.slice(0, EXCERPT_MAX),
                     at: now,
                     directory: directory() ?? dir,
+                    // The brain measures this process's live egress flows with
+                    // psutil: a WAN flap only moves the public address for new
+                    // flows, so a surviving keep-alive socket keeps the old
+                    // identity and the old limit. The pid is the one fact only
+                    // the plugin can supply; the sockets come from the kernel.
+                    pid: process.pid,
                 },
                 timeouts.pipeline,
                 { wait: false, prefix: PLUGIN_PREFIX.events },

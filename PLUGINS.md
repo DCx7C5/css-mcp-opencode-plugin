@@ -295,17 +295,25 @@ Default pattern:
 ```
 
 Matching normalizes typographic apostrophes and runs of whitespace. The
-cooldown is **10 minutes per signal/session**; the Python action registry keeps
+cooldown is **one minute per signal/session**; the Python action registry keeps
 the authoritative global cooldown, so a plugin reload or a second connection
-cannot re-trigger the action.
+cannot re-trigger the action. One minute, not ten: after a reconnect that left a
+pre-reconnect TCP flow alive, the only useful retry window is the ~30 s that
+flow needs to idle out.
 
 Wire body (`e:signal`, sent with `wait:false` — the event loop never waits for
 the brain):
 
 ```json
 { "signal": "free_messages_exhausted", "sessionID": "…", "messageID": "…",
-  "matched": "…", "excerpt": "…≤500 chars…", "at": 1730000000000, "directory": "…" }
+  "matched": "…", "excerpt": "…≤500 chars…", "at": 1730000000000, "directory": "…",
+  "pid": 48213 }
 ```
+
+`pid` is the opencode process (`process.pid`). The brain measures that process's
+live public flows with `psutil` before and after a WAN reconnect, so it can prove
+the new address is actually in use; the socket list cannot come from the plugin,
+because Bun keeps its fetch pool internal.
 
 Python replies `{accepted: boolean, signal, action?, dispatched?, deduped?, reason?}`.
 An older brain without the op replies `ok:false` (unknown op); the plugin logs it
