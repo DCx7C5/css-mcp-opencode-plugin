@@ -320,14 +320,26 @@ const HOOK_ADAPTERS = {
         input: { sessionID: e.sessionID },
         output: { prompt: undefined, context: [] },
         sync() {
-            // v1 let the brain replace the compaction prompt or inject
-            // context that survives. v2's lever is result.summary: setting
-            // it records the compaction and skips the model summarization.
-            if (typeof this.output.prompt === "string") {
-                e.result = { summary: this.output.prompt }
-            } else if (Array.isArray(this.output.context) && this.output.context.length > 0) {
-                e.result = { summary: this.output.context.join("\n\n") }
+            // v1: `prompt` replaced the summarization instruction and
+            // `context` injected items that survived beside the summary.
+            // v2 has neither channel. Setting `result` REPLACES the summary
+            // and skips the model call, so mapping `prompt`/`context` onto it
+            // collapsed the whole session to the injected block (~100
+            // tokens). Steer the summarizer through its system prompt and let
+            // OpenCode write the checkpoint instead.
+            const instructions = []
+            if (typeof this.output.prompt === "string" && this.output.prompt) {
+                instructions.push(this.output.prompt)
             }
+            if (Array.isArray(this.output.context) && this.output.context.length > 0) {
+                instructions.push(`Preserve this context in the summary:\n\n${this.output.context.join("\n\n")}`)
+            }
+            if (instructions.length === 0) return
+            if (!Array.isArray(e.system)) {
+                console.warn("[python-bridge] compaction hook: event.system missing; context not injected")
+                return
+            }
+            e.system.push({ type: "text", text: instructions.join("\n\n") })
         },
     }),
 }

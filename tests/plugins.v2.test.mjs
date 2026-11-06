@@ -175,7 +175,7 @@ test("hooks: tool.execute.after enrichment maps onto v2 result", async () => {
     await cleanup()
 })
 
-test("context: compaction hook maps prompt reply onto result.summary", async () => {
+test("context: compaction hook leaves result unset when the bridge is inert", async () => {
     const { ctx, registrations } = makeCtx()
     const { cleanup } = await runSetup("context", ctx)
     const cb = registrations["session:compaction"]
@@ -193,6 +193,38 @@ test("context: compaction hook maps prompt reply onto result.summary", async () 
     await cb(evt)
     // Inert bridge: no brain → no context reply → result stays unset.
     assert.equal(evt.result, undefined)
+    await cleanup()
+})
+
+test("context: compaction context steers the summarizer, never replaces the summary", async () => {
+    const { ctx, registrations } = makeCtx()
+    const { bridgeHooksV2 } = await import(new URL("../plugins/opencode-v2.js", import.meta.url))
+    const fakeServer = async () => ({
+        "experimental.session.compacting": async (_input, output) => {
+            output.prompt = "Summarize with the checkpoint headings."
+            output.context.push("PROJECT RULES: reload AGENTS.md")
+        },
+    })
+    const cleanup = await bridgeHooksV2(ctx, [fakeServer])
+    const cb = registrations["session:compaction"]
+    assert.ok(cb, "session.compaction registered")
+    const evt = {
+        sessionID: "s1",
+        model: "m",
+        system: [],
+        messages: [],
+        options: {},
+        agent: "a",
+        tools: {},
+        result: undefined,
+    }
+    await cb(evt)
+    // Setting result would replace the checkpoint and skip the model call —
+    // the ~100-token compaction regression.
+    assert.equal(evt.result, undefined)
+    assert.equal(evt.system.length, 1)
+    assert.match(evt.system[0].text, /checkpoint headings/)
+    assert.match(evt.system[0].text, /PROJECT RULES: reload AGENTS\.md/)
     await cleanup()
 })
 
