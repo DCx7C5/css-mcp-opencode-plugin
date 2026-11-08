@@ -88,7 +88,7 @@ const collectStrings = (node, depth = 0, out = [], maxDepth = 3) => {
 }
 
 export const server = async ({ client, directory, worktree, project }) => {
-    startBridge({ client, directory, worktree, project })
+    startBridge({ client, directory, worktree, project, part: "server" })
 
     return {
         "tool.execute.before": async (input, output) => {

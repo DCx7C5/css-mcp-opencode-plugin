@@ -15,6 +15,9 @@
  *    returned v1 hook map key onto the matching v2 domain hook with an
  *    event adapter that translates the v2 event into the v1 `(input,
  *    output)` pair and writes mutations back.
+ *  - `adaptTuiClient(client)` — adapts the TUI part's full `OpenCodeClient`
+ *    (the only context with credential list/create/remove and
+ *    `session.fork`) into the same fail-safe envelope contract.
  *
  * The per-concern plugins keep their named `server` export (v1 loader +
  * `npm test` rely on it) and gain a `default` export built here. The
@@ -33,6 +36,22 @@ const safe = async (fn, fallback) => {
         return fallback
     }
 }
+
+/**
+ * Fail-safe answer for a surface the SERVER part does not implement. The TUI
+ * part owns the credential list/create/remove and `session.fork` operations
+ * (`adaptTuiClient`), so the server stub never calls into `ctx`, never
+ * throws, and answers the same error envelope an absent domain does.
+ * @param {string} surface — e.g. "credential.list".
+ * @returns {Promise<{error: {message: string}}>}
+ */
+const serverOwnedByTui = (surface) =>
+    safe(
+        async () => ({
+            error: { message: `${surface} unavailable on the server part (the TUI part owns it)` },
+        }),
+        { error: { message: `${surface} unavailable on the server part (the TUI part owns it)` } },
+    )
 
 /**
  * How long a session counts as active for `session.broadcast`. A session that
@@ -123,13 +142,14 @@ const activeSessionMap = (ctx) => {
 }
 
 /**
- * Adapt the v2 plugin context into the v1-shaped SDK client the transport
- * and the plugin gates call (session.promptAsync, session.get/messages,
- * session.create/prompt/abort/summarize, app.agents, tool.ids,
- * postSessionIdPermissionsPermissionId). Every surface maps to a v2 domain
- * method where one exists; surfaces with no v2 equivalent resolve
- * fail-safe (log-level degradation, never a crash).
- * @param {object} ctx — v2 plugin context.
+ * Adapt the v2 SERVER plugin context into the v1-shaped SDK client the
+ * transport and the plugin gates call (session.promptAsync, session.get/
+ * messages/create/prompt/abort/summarize, credential.activate, app.agents,
+ * tool.ids, postSessionIdPermissionsPermissionId). Every surface maps to a
+ * v2 domain method where one exists; the surfaces the TUI part owns
+ * (credential.list/create/remove, session.fork) resolve a fail-safe stub —
+ * never a throw, never a call into a missing method.
+ * @param {object} ctx — v2 server plugin context.
  */
 const adaptClient = (ctx) => {
     const session = ctx?.session ?? {}
@@ -249,6 +269,28 @@ const adaptClient = (ctx) => {
                 }),
             abort: ({ path }) =>
                 safe(async () => session.interrupt({ sessionID: path.id, continue: false }), {}),
+            // The server-part session domain has no `fork`; the TUI part owns
+            // it (see `adaptTuiClient`). A flat stub keeps a push consumer
+            // from calling a missing method or throwing into its handler.
+            fork: () => serverOwnedByTui("session.fork"),
+        },
+        // The server context exposes `credential.activate` only. Listing,
+        // creating and removing credentials run in the TUI part, which
+        // outlives `opencode service stop`; the stubs are honest failures,
+        // not empty results, so a caller can tell "unavailable on this part"
+        // from "no credentials".
+        credential: {
+            list: () => serverOwnedByTui("credential.list"),
+            create: () => serverOwnedByTui("credential.create"),
+            activate: ({ credentialID }) =>
+                safe(
+                    async () => {
+                        await ctx.credential.activate({ credentialID })
+                        return { ok: true }
+                    },
+                    { error: { message: "credential.activate unavailable (v2 ctx)" } },
+                ),
+            remove: () => serverOwnedByTui("credential.remove"),
         },
         // v1 'reject' maps 1:1 to v2 Permission.Reply ('once'|'always'|'reject').
         postSessionIdPermissionsPermissionId: ({ path, body = {} }) =>
@@ -261,6 +303,120 @@ const adaptClient = (ctx) => {
                     }),
                 { ok: false },
             ),
+    }
+}
+
+/**
+ * Adapt the TUI part's `OpenCodeClient` into the credential/session control
+ * surface the quota-rotation path uses. The TUI context is the only one with
+ * a full client and the only part that outlives `opencode service stop`, so
+ * every credential/session operation beyond the server's `credential.activate`
+ * runs here.
+ *
+ * Every method resolves an envelope and never throws:
+ *   `{ok:true, …payload}` or `{ok:false, error:{code:"unsupported"|"call_failed", message}}`
+ * A missing client method is `unsupported`; a rejected call is `call_failed`.
+ * `CredentialEntry.value` never leaves this layer: `list` answers
+ * `{ok:true, credentials:[{id, integrationID, label, active}]}` and `create`
+ * answers `{ok:true, id, label, integrationID, active}`.
+ *
+ * @param {object} client — the TUI context's OpenCodeClient.
+ */
+export const adaptTuiClient = (client) => {
+    const unsupported = (surface) => ({
+        ok: false,
+        error: { code: "unsupported", message: `${surface} unavailable on the TUI client` },
+    })
+    const callFailed = (err) => ({
+        ok: false,
+        error: { code: "call_failed", message: err?.message ?? String(err) },
+    })
+
+    return {
+        credential: {
+            list: async () => {
+                const list = client?.credential?.list
+                if (typeof list !== "function") return unsupported("credential.list")
+                try {
+                    const res = await list.call(client.credential)
+                    const entries = Array.isArray(res) ? res : Array.isArray(res?.data) ? res.data : []
+                    return {
+                        ok: true,
+                        credentials: entries.map((entry) => ({
+                            id: entry?.id,
+                            integrationID: entry?.integrationID,
+                            label: entry?.label,
+                            active: entry?.active,
+                        })),
+                    }
+                } catch (err) {
+                    return callFailed(err)
+                }
+            },
+            create: async ({ integrationID, label, key }) => {
+                const create = client?.credential?.create
+                if (typeof create !== "function") return unsupported("credential.create")
+                try {
+                    const res = await create.call(client.credential, {
+                        integrationID,
+                        label,
+                        value: { type: "key", key },
+                    })
+                    const entry = res?.data ?? res ?? {}
+                    return {
+                        ok: true,
+                        id: entry.id,
+                        label: entry.label,
+                        integrationID: entry.integrationID,
+                        active: entry.active,
+                    }
+                } catch (err) {
+                    return callFailed(err)
+                }
+            },
+            activate: async ({ credentialID }) => {
+                const activate = client?.credential?.activate
+                if (typeof activate !== "function") return unsupported("credential.activate")
+                try {
+                    await activate.call(client.credential, { credentialID })
+                    return { ok: true }
+                } catch (err) {
+                    return callFailed(err)
+                }
+            },
+            remove: async ({ credentialID }) => {
+                const remove = client?.credential?.remove
+                if (typeof remove !== "function") return unsupported("credential.remove")
+                try {
+                    await remove.call(client.credential, { credentialID })
+                    return { ok: true }
+                } catch (err) {
+                    return callFailed(err)
+                }
+            },
+        },
+        session: {
+            fork: async ({ sessionID, before }) => {
+                const fork = client?.session?.fork
+                if (typeof fork !== "function") return unsupported("session.fork")
+                try {
+                    const res = await fork.call(client.session, { sessionID, before })
+                    return { ok: true, id: (res?.data ?? res)?.id }
+                } catch (err) {
+                    return callFailed(err)
+                }
+            },
+            prompt: async ({ sessionID, text }) => {
+                const prompt = client?.session?.prompt
+                if (typeof prompt !== "function") return unsupported("session.prompt")
+                try {
+                    await prompt.call(client.session, { sessionID, text })
+                    return { ok: true }
+                } catch (err) {
+                    return callFailed(err)
+                }
+            },
+        },
     }
 }
 
@@ -437,4 +593,3 @@ export async function bridgeHooksV2(ctx, servers) {
         }
     }
 }
-

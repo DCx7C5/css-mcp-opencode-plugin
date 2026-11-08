@@ -308,3 +308,228 @@ test("v2 activity tracker: status/execution events mark sessions broadcast-activ
     const res = await adapted.session.active()
     assert.deepEqual(Object.keys(res.data).sort(), ["s-429", "s-exec", "s-run"])
 })
+
+/** Adapt a v2 server ctx into the v1-shaped client without registering a plugin. */
+const adaptOnly = async (ctx) => {
+    const { bridgeHooksV2 } = await import(new URL("../plugins/opencode-v2.js", import.meta.url))
+    let adapted
+    await bridgeHooksV2(ctx, [
+        async ({ client }) => {
+            adapted = client
+            return {}
+        },
+    ])
+    return adapted
+}
+
+test("v2 server stubs: TUI-owned surfaces fail safe without touching ctx", async () => {
+    let touchedCredential = false
+    let touchedFork = false
+    const ctx = {
+        get credential() {
+            touchedCredential = true
+            return undefined
+        },
+        session: {
+            get fork() {
+                touchedFork = true
+                return undefined
+            },
+        },
+    }
+    const client = await adaptOnly(ctx)
+
+    for (const surface of ["list", "create", "remove"]) {
+        assert.equal(typeof client.credential?.[surface], "function", `credential.${surface} exists`)
+    }
+    assert.equal(typeof client.session.fork, "function", "session.fork exists")
+    assert.equal(typeof client.credential.activate, "function", "server credential.activate stays real")
+    assert.equal(client.integration, undefined, "no client.integration")
+
+    const results = [
+        await client.credential.list(),
+        await client.credential.create({ integrationID: "opencode", label: "L", key: "k" }),
+        await client.credential.remove({ credentialID: "cred_1" }),
+        await client.session.fork({ path: { id: "s1" } }),
+    ]
+    for (const res of results) {
+        // Each stub resolves (never throws) an error object — not an empty
+        // result that a caller could mistake for "no credentials".
+        assert.match(res.error.message, /unavailable on the server part \(the TUI part owns it\)/)
+        assert.equal("data" in res, false)
+    }
+    assert.equal(touchedCredential, false, "stubs never read ctx.credential")
+    assert.equal(touchedFork, false, "session.fork stub never reads ctx.session.fork")
+})
+
+test("v2 server credential.activate: real mapping, fail-safe when absent", async () => {
+    const calls = []
+    const ctx = {
+        session: {},
+        credential: {
+            activate: async (input) => {
+                calls.push(input)
+            },
+        },
+    }
+    const client = await adaptOnly(ctx)
+    assert.deepEqual(await client.credential.activate({ credentialID: "cred_1" }), { ok: true })
+    assert.deepEqual(calls, [{ credentialID: "cred_1" }])
+
+    const absent = await adaptOnly({ session: {} })
+    const res = await absent.credential.activate({ credentialID: "cred_1" })
+    assert.match(res.error.message, /credential\.activate unavailable/)
+})
+
+test("adaptTuiClient: exact param/return mapping over the TUI client", async () => {
+    const { adaptTuiClient } = await import(new URL("../plugins/opencode-v2.js", import.meta.url))
+    const calls = { create: [], activate: [], remove: [], fork: [], prompt: [] }
+    const client = adaptTuiClient({
+        credential: {
+            list: async () => [
+                {
+                    id: "cred_1",
+                    integrationID: "opencode",
+                    label: "OPENCODE_API_KEY",
+                    active: true,
+                    value: { type: "key", key: "stored-secret" },
+                },
+            ],
+            create: async (input) => {
+                calls.create.push(input)
+                return {
+                    id: "cred_2",
+                    integrationID: input.integrationID,
+                    label: input.label,
+                    active: true,
+                    value: input.value,
+                }
+            },
+            activate: async (input) => calls.activate.push(input),
+            remove: async (input) => calls.remove.push(input),
+        },
+        session: {
+            fork: async (input) => {
+                calls.fork.push(input)
+                return { id: "s-fork", parentID: input.sessionID }
+            },
+            prompt: async (input) => calls.prompt.push(input),
+        },
+    })
+
+    assert.deepEqual(await client.credential.list(), {
+        ok: true,
+        credentials: [{ id: "cred_1", integrationID: "opencode", label: "OPENCODE_API_KEY", active: true }],
+    })
+
+    const created = await client.credential.create({
+        integrationID: "opencode",
+        label: "OPENCODE_API_KEY_1",
+        key: "next-secret",
+    })
+    // create maps the caller's `key` into the client's value union.
+    assert.deepEqual(calls.create, [
+        { integrationID: "opencode", label: "OPENCODE_API_KEY_1", value: { type: "key", key: "next-secret" } },
+    ])
+    assert.deepEqual(created, {
+        ok: true,
+        id: "cred_2",
+        label: "OPENCODE_API_KEY_1",
+        integrationID: "opencode",
+        active: true,
+    })
+
+    assert.deepEqual(await client.credential.activate({ credentialID: "cred_1" }), { ok: true })
+    assert.deepEqual(await client.credential.remove({ credentialID: "cred_1" }), { ok: true })
+    assert.deepEqual(calls.activate, [{ credentialID: "cred_1" }])
+    assert.deepEqual(calls.remove, [{ credentialID: "cred_1" }])
+
+    assert.deepEqual(await client.session.fork({ sessionID: "s1", before: "m9" }), { ok: true, id: "s-fork" })
+    assert.deepEqual(calls.fork, [{ sessionID: "s1", before: "m9" }])
+    // An omitted `before` still maps the exact two-key request shape.
+    await client.session.fork({ sessionID: "s2" })
+    assert.deepEqual(calls.fork[1], { sessionID: "s2", before: undefined })
+
+    assert.deepEqual(await client.session.prompt({ sessionID: "s1", text: "ignore rate limit & resume" }), {
+        ok: true,
+    })
+    assert.deepEqual(calls.prompt, [{ sessionID: "s1", text: "ignore rate limit & resume" }])
+
+    // `value` is input-only: no output may carry the secret or the field.
+    const outputs = JSON.stringify([await client.credential.list(), created])
+    assert.equal(outputs.includes("value"), false)
+    assert.equal(outputs.includes("stored-secret"), false)
+    assert.equal(outputs.includes("next-secret"), false)
+})
+
+test("adaptTuiClient: missing methods are unsupported, rejected calls are call_failed", async () => {
+    const { adaptTuiClient } = await import(new URL("../plugins/opencode-v2.js", import.meta.url))
+    const empty = adaptTuiClient({})
+    const attempts = [
+        ["credential.list", () => empty.credential.list()],
+        ["credential.create", () => empty.credential.create({ integrationID: "o", label: "L", key: "k" })],
+        ["credential.activate", () => empty.credential.activate({ credentialID: "cred_1" })],
+        ["credential.remove", () => empty.credential.remove({ credentialID: "cred_1" })],
+        ["session.fork", () => empty.session.fork({ sessionID: "s1" })],
+        ["session.prompt", () => empty.session.prompt({ sessionID: "s1", text: "t" })],
+    ]
+    for (const [surface, attempt] of attempts) {
+        const res = await attempt() // resolves, never throws
+        assert.equal(res.ok, false)
+        assert.equal(res.error.code, "unsupported", `${surface} unsupported`)
+        assert.match(res.error.message, /unavailable on the TUI client/)
+    }
+
+    const broken = adaptTuiClient({
+        credential: {
+            list: async () => {
+                throw new Error("list boom")
+            },
+            create: async () => {
+                throw new Error("create boom")
+            },
+            activate: async () => Promise.reject(new Error("activate boom")),
+            remove: async () => {
+                throw new Error("remove boom")
+            },
+        },
+        session: {
+            fork: async () => {
+                throw new Error("fork boom")
+            },
+            prompt: async () => {
+                throw new Error("prompt boom")
+            },
+        },
+    })
+    const failedAttempts = [
+        ["list boom", () => broken.credential.list()],
+        ["create boom", () => broken.credential.create({ integrationID: "o", label: "L", key: "k" })],
+        ["activate boom", () => broken.credential.activate({ credentialID: "cred_1" })],
+        ["remove boom", () => broken.credential.remove({ credentialID: "cred_1" })],
+        ["fork boom", () => broken.session.fork({ sessionID: "s1" })],
+        ["prompt boom", () => broken.session.prompt({ sessionID: "s1", text: "t" })],
+    ]
+    for (const [message, attempt] of failedAttempts) {
+        const res = await attempt()
+        assert.equal(res.ok, false)
+        assert.equal(res.error.code, "call_failed")
+        assert.equal(res.error.message, message)
+    }
+
+    // A partially-present client: present methods work, absent ones are unsupported.
+    const partial = adaptTuiClient({ credential: { activate: async () => {} } })
+    assert.deepEqual(await partial.credential.activate({ credentialID: "cred_1" }), { ok: true })
+    assert.equal((await partial.credential.list()).error.code, "unsupported")
+})
+
+test("v2 adapter: the only environment read is the broadcast-window knob", async () => {
+    const { readFile } = await import("node:fs/promises")
+    const src = await readFile(new URL("../plugins/opencode-v2.js", import.meta.url), "utf8")
+    // A credential value is read from `process.env[label]` at the consumer
+    // (the TUI control consumer), never here: this module may only read the
+    // broadcast-window knob by its literal name.
+    const envReads = [...new Set([...src.matchAll(/process\.env\.([A-Za-z_][A-Za-z0-9_]*)/g)].map((m) => m[1]))]
+    assert.deepEqual(envReads, ["OPENCODE_BROADCAST_WINDOW_MS"])
+    assert.equal(/process\.env\s*\[/.test(src), false, "no dynamic process.env[...] credential lookup")
+})

@@ -29,7 +29,7 @@ import {
 } from "./transport.js"
 
 export const server = async ({ client, directory: dir, worktree: wt, project }) => {
-    startBridge({ client, directory: dir, worktree: wt, project })
+    startBridge({ client, directory: dir, worktree: wt, project, part: "server" })
     const debug = debugEnabled()
     const log = (msg) => debug && console.debug("[python-bridge]", "[debug]", msg)
 

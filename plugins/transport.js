@@ -5,7 +5,8 @@
  * It owns the socket connection pool, the bootstrap handshake / capability
  * gate, the rpc() wrapper, the event debouncer, and the push consumers
  * (`capabilities.update`, `session.inject`, `session.context.read`,
- * `task.launch`, `session.intel`, `session.summarize`). Per-concern plugins
+ * `task.launch`, `session.intel`, `session.summarize`) plus the per-channel
+ * consumers registered through `onPush`. Per-concern plugins
  * in `plugins/` import from here and register only their own hooks. Because
  * ESM modules are singletons within one opencode process, all plugins share
  * one socket and one capability declaration no matter how many of them are
@@ -161,6 +162,24 @@ let bootstrapWaiters = []
 const hasCap = (key) => bootstrap.status === "ready" && bootstrap.caps.has(key)
 
 /**
+ * Shared per-instance input context captured by the first startBridge call
+ * that supplies each field. `part` names which side of the bridge this
+ * process is — `server` (the server-side plugins) or `tui` (the TUI part) —
+ * and rides the bootstrap handshake. A process that never named one omits
+ * the field, which the Python side ignores.
+ */
+const bridgeEnv = {
+    /** @type {string|undefined} */
+    directory: undefined,
+    /** @type {string|undefined} */
+    worktree: undefined,
+    /** @type {{ name?: string, id?: string }|undefined} */
+    project: undefined,
+    /** @type {"server"|"tui"|undefined} */
+    part: undefined,
+}
+
+/**
  * Wait for the bootstrap handshake to settle (ready or failed).
  * The wait is bounded by the bootstrap RPC's own deadline, so queued hooks
  * cannot hang forever on a dead Python server.
@@ -203,7 +222,10 @@ function startBootstrap() {
     const gen = ++bootstrapGen
     bootstrap.status = "pending"
     bootstrap.caps = new Set()
-    rpc("bootstrap", { protocol: "v0.4" }, BOOTSTRAP_TIMEOUT_MS).then((msg) => {
+    // `part` names the bridge side of this process (server plugins or the TUI
+    // part); a process that never named one omits the field entirely.
+    const body = bridgeEnv.part ? { protocol: "v0.4", part: bridgeEnv.part } : { protocol: "v0.4" }
+    rpc("bootstrap", body, BOOTSTRAP_TIMEOUT_MS).then((msg) => {
         if (gen !== bootstrapGen) return
         bootstrapInFlight = false
         if (msg && msg.ok === true && msg.capabilities && typeof msg.capabilities === "object") {
@@ -734,13 +756,20 @@ async function answerPermission(id, body, prefix = "") {
 /**
  * Owning plugin letter for reverse-RPC reply channels. The reply line written
  * by `pool.reply()` is JS→Python traffic, so it carries the plugin prefix of
- * the channel's owner: context reads/intel/summarize → plugin-context (`c`),
- * task launch → plugin-task (`t`), permission answer → plugin-permission (`p`).
+ * the channel's owner: context reads/intel/summarize, credential
+ * remove/install and session fork → plugin-context (`c`), task launch →
+ * plugin-task (`t`), permission answer → plugin-permission (`p`).
+ *
+ * `tabs.switch` is deliberately absent: it is fire-and-forget, so no reply
+ * line is ever written for it.
  */
 const REPLY_PREFIX = {
     "session.context.read": PLUGIN_PREFIX.context,
     "session.intel": PLUGIN_PREFIX.context,
     "session.summarize": PLUGIN_PREFIX.context,
+    "credential.remove": PLUGIN_PREFIX.context,
+    "credential.install": PLUGIN_PREFIX.context,
+    "session.fork": PLUGIN_PREFIX.context,
     "task.launch": PLUGIN_PREFIX.task,
     "permission.answer": PLUGIN_PREFIX.permission,
 }
@@ -894,6 +923,39 @@ async function abortSessions(id, sessionIDs) {
 }
 
 /**
+ * Registered push consumers, one handler per channel. Built-in consumers run
+ * first and return, so a channel handled in `handlePush` never reaches these;
+ * every other channel is offered to the handler registered here. Handlers
+ * receive `(body, reply)`, where `reply(id, ok, payload)` writes the standard
+ * `{id, ok, ...payload}` envelope with the channel's owning plugin prefix —
+ * the shape the Python side resolves from its pending map.
+ *
+ * @type {Map<string, (body: Record<string, any>, reply: (id: string, ok: boolean, payload?: Record<string, any>) => void) => any>}
+ */
+const pushHandlers = new Map()
+
+/**
+ * Register the push consumer for a channel. Exactly one consumer per channel:
+ * a second registration would double-apply a Python command, so it throws.
+ * @param {string} channel
+ * @param {(body: Record<string, any>, reply: (id: string, ok: boolean, payload?: Record<string, any>) => void) => any} handler
+ * @returns {void}
+ */
+export function onPush(channel, handler) {
+    if (typeof channel !== "string" || !channel) {
+        throw new TypeError("onPush: channel must be a non-empty string")
+    }
+    if (typeof handler !== "function") {
+        throw new TypeError(`onPush(${channel}): handler must be a function`)
+    }
+    if (pushHandlers.has(channel)) {
+        throw new Error(`onPush: channel "${channel}" already has a handler`)
+    }
+    pushHandlers.set(channel, handler)
+    log.debug(`push: registered consumer channel=${channel}`)
+}
+
+/**
  * Handle a push from the Python server. Push dispatch runs BEFORE orphan
  * matching in the pool data handler.
  * @param {string} channel
@@ -969,6 +1031,25 @@ function handlePush(channel, body) {
     }
     // permissions.update is informational on the JS side: permission rules
     // live in the Python brain, so no consumer is needed here.
+
+    // A channel with no built-in consumer is offered to the single handler
+    // registered through `onPush`. Handler failures never escape into the
+    // pool data handler.
+    const handler = pushHandlers.get(channel)
+    if (handler) {
+        const reply = (id, ok, payload = {}) => pool.reply(id, ok, payload, REPLY_PREFIX[channel] ?? "")
+        try {
+            const pending = handler(body, reply)
+            if (pending && typeof pending.then === "function") {
+                pending.then(undefined, (err) => {
+                    log.error(`push channel=${channel}: handler rejected: ${err?.message ?? String(err)}`)
+                })
+            }
+        } catch (err) {
+            log.error(`push channel=${channel}: handler threw: ${err?.message ?? String(err)}`)
+        }
+        return
+    }
     log.debug(`push channel=${channel} (no consumer)`)
 }
 
@@ -1150,7 +1231,14 @@ class SocketPool {
                     const msg = JSON.parse(raw)
                     if (msg && msg.type === "push") {
                         // Push dispatch happens BEFORE orphan matching.
-                        handlePush(msg.channel, msg.body)
+                        // Python sends a reverse-RPC reply id ONLY at envelope
+                        // level (`{type:"push", channel, body, id}`), so merge
+                        // it into the body — consumers reply with `body.id`.
+                        // A body-level id wins (session.inject dedupe uses it).
+                        const body = msg.body && typeof msg.body === "object"
+                            ? { ...msg.body, id: msg.body.id ?? msg.id }
+                            : msg.body
+                        handlePush(msg.channel, body)
                         continue
                     }
                     const entry = this.#pending.get(msg.id)
@@ -1529,29 +1617,25 @@ let activeClient = null
 
 // ── plugin bootstrapping ──────────────────────────────────────────────
 
-/** Shared per-instance input context captured by the first startBridge call. */
-const bridgeEnv = {
-    /** @type {string|undefined} */
-    directory: undefined,
-    /** @type {string|undefined} */
-    worktree: undefined,
-    /** @type {{ name?: string, id?: string }|undefined} */
-    project: undefined,
-}
-
 /**
  * Initialize the shared bridge from a plugin instance's input. Idempotent:
  * the socket stat check runs once, `activeClient` is set to the newest
  * instance, and the bootstrap handshake is kicked exactly once (the
  * in-flight guard in startBootstrap prevents double-fire).
  *
- * @param {{ client?: import("@opencode-ai/sdk").SdkClient, directory?: string, worktree?: string, project?: { name?: string, id?: string } }} input
+ * `part` identifies which side of the bridge this process is — `server` for
+ * the server-side plugins, `tui` for the TUI part. It rides the bootstrap
+ * handshake so the brain can tell its connections apart; a missing or
+ * unknown value is ignored and the handshake omits the field.
+ *
+ * @param {{ client?: import("@opencode-ai/sdk").SdkClient, directory?: string, worktree?: string, project?: { name?: string, id?: string }, part?: "server"|"tui" }} input
  */
 export function startBridge(input) {
     activeClient = input?.client ?? null
     bridgeEnv.directory ??= input?.directory
     bridgeEnv.worktree ??= input?.worktree
     bridgeEnv.project ??= input?.project
+    if (input?.part === "server" || input?.part === "tui") bridgeEnv.part = input.part
 
     const statOnce = async () => {
         try {

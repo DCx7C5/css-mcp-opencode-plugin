@@ -1,6 +1,10 @@
 /**
- * TUI tab-producer tests — the TUI plugin context is the only one with a tab
- * strip. `plugins/tui-tabs.js` is imported directly: `plugins/tui.js` imports
+ * TUI part tests — the tab-strip producer, the definition that boots it, and
+ * the tab-fork channel that moves the strip.
+ *
+ * The TUI plugin context is the only one with a tab strip and the only one
+ * whose environment carries the credential keys. `plugins/tui-tabs.js` and
+ * `plugins/tui-control.js` are imported directly: `plugins/tui.js` imports
  * `@opencode/plugin/tui`, which only resolves inside the opencode runtime.
  *
  * Assertions:
@@ -11,11 +15,26 @@
  *  - setup pushes immediately, on both failure events and on the interval,
  *    and cleanup unsubscribes both events and stops the interval;
  *  - a rejecting transport or a throwing strip never escapes setup or a
- *    handler.
+ *    handler;
+ *  - `createTuiDefinition` boots `startBridge({part:"tui"})` with NO client and
+ *    before the first publish, then registers the control channels with the
+ *    context's own client/strip/state bus/logger, then publishes; a throwing
+ *    boot step still leaves a working publisher;
+ *  - `tabs.fork` forks → opens → focuses → closes per tab, ignores draft tabs,
+ *    skips a subagent child without forking or closing it, leaves the old tab
+ *    open on a failed fork and continues, answers `tabs_disabled` for a strip
+ *    that is off or unreadable, and replies `{moves, failed, skipped}`.
  */
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { createTabsDefinition, createTabsPusher, tabPayload, TABS_INTERVAL_MS } from "../plugins/tui-tabs.js"
+import {
+    createTabsDefinition,
+    createTabsPusher,
+    createTuiDefinition,
+    tabPayload,
+    TABS_INTERVAL_MS,
+} from "../plugins/tui-tabs.js"
+import { createTuiControlHandlers } from "../plugins/tui-control.js"
 import { PLUGIN_PREFIX, timeouts } from "../plugins/transport.js"
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -170,4 +189,381 @@ test("setup tolerates missing and throwing event buses", async () => {
     }).setup(throwing)
     assert.equal(throwingCalls.length, 1)
     throwingCleanup()
+})
+
+// ── composition: boot the bridge, wire the controls, then publish ──────
+
+test("createTuiDefinition boots startBridge({part:'tui'}) with no client before the first publish", () => {
+    const { context } = fakeContext({ tabs: measuredTabs })
+    const order = []
+    const boots = []
+    const registrations = []
+    const sends = []
+    const definition = createTuiDefinition({
+        intervalMs: 1000,
+        boot: (input) => {
+            boots.push(input)
+            order.push("startBridge")
+        },
+        register: (input) => {
+            registrations.push(input)
+            order.push("registerTuiControl")
+        },
+        send: async (...args) => {
+            sends.push(args)
+            order.push("publish")
+        },
+    })
+    assert.equal(definition.id, "css-mcp-opencode-plugin/tui")
+
+    const cleanup = definition.setup(context)
+    assert.equal(typeof cleanup, "function")
+
+    assert.equal(boots.length, 1, "startBridge is booted exactly once")
+    assert.deepEqual(boots[0], { part: "tui" })
+    assert.equal(Object.hasOwn(boots[0], "client"), false, "the TUI part must install no client")
+    assert.equal(registrations.length, 1, "the control channels are registered once")
+    assert.deepEqual(order, ["startBridge", "registerTuiControl", "publish"])
+    assert.equal(sends.length, 1)
+
+    cleanup()
+})
+
+test("createTuiDefinition hands the context's own client, strip, state bus and logger to the controls", () => {
+    const tabs = { enabled: () => true, list: () => measuredTabs }
+    const client = { session: {} }
+    const data = { session: { get: () => undefined } }
+    const log = { debug: () => {} }
+    const seen = []
+    const cleanup = createTuiDefinition({
+        intervalMs: 1000,
+        boot: () => {},
+        register: (input) => seen.push(input),
+        send: async () => {},
+    }).setup({ client, ui: { tabs }, data, log })
+
+    assert.equal(seen.length, 1)
+    assert.equal(seen[0].client, client)
+    assert.equal(seen[0].tabs, tabs)
+    assert.equal(seen[0].data, data)
+    assert.equal(seen[0].log, log)
+    cleanup()
+})
+
+test("createTuiDefinition passes a null strip when the context has no tab strip", () => {
+    const seen = []
+    const cleanup = createTuiDefinition({
+        intervalMs: 1000,
+        boot: () => {},
+        register: (input) => seen.push(input),
+        send: async () => {},
+    }).setup({ client: {}, data: {}, log: {} })
+
+    assert.equal(seen[0].tabs, null)
+    cleanup()
+})
+
+test("createTuiDefinition keeps a working tab publisher when a boot step throws", () => {
+    const { context } = fakeContext({ tabs: measuredTabs })
+    const calls = []
+
+    const bootFailure = createTuiDefinition({
+        intervalMs: 1000,
+        boot: () => {
+            throw new Error("no transport")
+        },
+        register: () => {},
+        send: async (...args) => {
+            calls.push(args)
+        },
+    })
+    const bootCleanup = bootFailure.setup(context)
+    assert.equal(calls.length, 1, "the first publish still happens")
+    bootCleanup()
+
+    const registerFailure = createTuiDefinition({
+        intervalMs: 1000,
+        boot: () => {},
+        register: () => {
+            throw new Error('onPush: channel "credential.remove" already has a handler')
+        },
+        send: async (...args) => {
+            calls.push(args)
+        },
+    })
+    const registerCleanup = registerFailure.setup(context)
+    assert.equal(calls.length, 2, "a duplicate registration still yields a publish")
+    registerCleanup()
+})
+
+// ── tabs.fork: the whole-strip command ────────────────────────────────
+
+/**
+ * A tab strip that records every mutation into the shared `calls` array, so
+ * the per-tab sequence across the client and the strip is directly assertable.
+ * `enabled`/`tabs` may be the literal "throw" to exercise an unreadable strip.
+ */
+function fakeStrip(calls, { tabs = measuredTabs, enabled = true, failOn } = {}) {
+    const record = (method) => (sessionID) => {
+        calls.push({ method, sessionID })
+        if (failOn === method) throw new Error(`${method} refused ${sessionID}`)
+    }
+    return {
+        enabled() {
+            if (enabled === "throw") throw new Error("no strip")
+            return enabled
+        },
+        list() {
+            if (tabs === "throw") throw new Error("no strip")
+            return tabs
+        },
+        open: record("open"),
+        focus: record("focus"),
+        close: record("close"),
+    }
+}
+
+/** A client whose `session.fork` maps old ids to new ones, or refuses them. */
+function forkClient(calls, { forks = {}, failFor = [], missing = false } = {}) {
+    return {
+        session: missing
+            ? {}
+            : {
+                  async fork({ sessionID }) {
+                      calls.push({ method: "fork", sessionID })
+                      if (failFor.includes(sessionID)) throw new Error(`fork refused ${sessionID}`)
+                      const toSessionID = forks[sessionID]
+                      return toSessionID === undefined ? {} : { id: toSessionID }
+                  },
+              },
+    }
+}
+
+/** A state bus whose `session.get` answers from a literal table. */
+function sessionState(table) {
+    return {
+        session: {
+            get(sessionID) {
+                if (table === "throw") throw new Error("no session state")
+                return table[sessionID]
+            },
+        },
+    }
+}
+
+const silentLog = { debug: () => {} }
+
+/** Drive one control handler and return its single reply envelope. */
+async function invoke(handlers, channel, body = {}) {
+    const replies = []
+    await handlers[channel](body, (id, ok, payload) => replies.push({ id, ok, payload }))
+    assert.equal(replies.length, 1, `${channel} must reply exactly once`)
+    return replies[0]
+}
+
+test("tabs.fork forks, opens, focuses and closes each tab in that order", async () => {
+    const calls = []
+    const handlers = createTuiControlHandlers({
+        client: forkClient(calls, { forks: { ses_one: "ses_one_fork", ses_two: "ses_two_fork" } }),
+        tabs: fakeStrip(calls),
+        data: sessionState({}),
+        log: silentLog,
+    })
+
+    const reply = await invoke(handlers, "tabs.fork", { id: "tf1" })
+    assert.deepEqual(reply, {
+        id: "tf1",
+        ok: true,
+        payload: {
+            moves: [
+                { fromSessionID: "ses_one", toSessionID: "ses_one_fork" },
+                { fromSessionID: "ses_two", toSessionID: "ses_two_fork" },
+            ],
+            failed: [],
+            skipped: [],
+        },
+    })
+    assert.deepEqual(calls, [
+        { method: "fork", sessionID: "ses_one" },
+        { method: "open", sessionID: "ses_one_fork" },
+        { method: "focus", sessionID: "ses_one_fork" },
+        { method: "close", sessionID: "ses_one" },
+        { method: "fork", sessionID: "ses_two" },
+        { method: "open", sessionID: "ses_two_fork" },
+        { method: "focus", sessionID: "ses_two_fork" },
+        { method: "close", sessionID: "ses_two" },
+    ])
+})
+
+test("tabs.fork on an empty strip answers three empty lists", async () => {
+    const calls = []
+    const handlers = createTuiControlHandlers({
+        client: forkClient(calls),
+        tabs: fakeStrip(calls, { tabs: [] }),
+        data: sessionState({}),
+        log: silentLog,
+    })
+
+    const reply = await invoke(handlers, "tabs.fork", { id: "tf2" })
+    assert.deepEqual(reply, { id: "tf2", ok: true, payload: { moves: [], failed: [], skipped: [] } })
+    assert.deepEqual(calls, [])
+})
+
+test("tabs.fork ignores a draft tab and accepts both runtime tab shapes", async () => {
+    const calls = []
+    const handlers = createTuiControlHandlers({
+        client: forkClient(calls, { forks: { ses_a: "ses_a_fork", ses_b: "ses_b_fork" } }),
+        tabs: fakeStrip(calls, {
+            tabs: [
+                { key: "tab-draft", session: undefined, active: true },
+                { key: "tab-a", session: { id: "ses_a" }, active: false },
+                { sessionID: "ses_b", title: "B", active: false },
+            ],
+        }),
+        data: sessionState({}),
+        log: silentLog,
+    })
+
+    const reply = await invoke(handlers, "tabs.fork", { id: "tf3" })
+    assert.deepEqual(reply.payload.moves, [
+        { fromSessionID: "ses_a", toSessionID: "ses_a_fork" },
+        { fromSessionID: "ses_b", toSessionID: "ses_b_fork" },
+    ])
+    assert.deepEqual(reply.payload.failed, [])
+    assert.deepEqual(reply.payload.skipped, [])
+})
+
+test("tabs.fork skips a subagent tab into `skipped` and never forks or closes it", async () => {
+    const calls = []
+    const handlers = createTuiControlHandlers({
+        client: forkClient(calls, {
+            forks: { ses_root: "ses_root_fork", ses_child_forked: "ses_child_forked_fork" },
+        }),
+        tabs: fakeStrip(calls, {
+            tabs: [
+                { sessionID: "ses_root", active: true },
+                { sessionID: "ses_child", active: false },
+                { sessionID: "ses_child_forked", active: false },
+            ],
+        }),
+        data: sessionState({
+            ses_root: { id: "ses_root" },
+            ses_child: { id: "ses_child", parentID: "ses_root" },
+            // A subagent that already carries a `fork` marker was moved here by
+            // an earlier fork, so it is a target again.
+            ses_child_forked: { id: "ses_child_forked", parentID: "ses_root", fork: {} },
+        }),
+        log: silentLog,
+    })
+
+    const reply = await invoke(handlers, "tabs.fork", { id: "tf4" })
+    assert.deepEqual(reply.payload.skipped, ["ses_child"])
+    assert.deepEqual(reply.payload.moves, [
+        { fromSessionID: "ses_root", toSessionID: "ses_root_fork" },
+        { fromSessionID: "ses_child_forked", toSessionID: "ses_child_forked_fork" },
+    ])
+    assert.ok(
+        !calls.some((call) => call.method === "fork" && call.sessionID === "ses_child"),
+        "a subagent session is never forked",
+    )
+    assert.ok(
+        !calls.some((call) => call.method === "close" && call.sessionID === "ses_child"),
+        "a subagent tab is never closed",
+    )
+})
+
+test("tabs.fork treats an unclassifiable tab as a target", async () => {
+    for (const data of [sessionState("throw"), {}, null]) {
+        const calls = []
+        const handlers = createTuiControlHandlers({
+            client: forkClient(calls, { forks: { ses_one: "ses_one_fork" } }),
+            tabs: fakeStrip(calls, { tabs: [{ sessionID: "ses_one", active: true }] }),
+            data,
+            log: silentLog,
+        })
+        const reply = await invoke(handlers, "tabs.fork", { id: "tf5" })
+        assert.deepEqual(reply.payload.moves, [{ fromSessionID: "ses_one", toSessionID: "ses_one_fork" }])
+        assert.deepEqual(reply.payload.skipped, [])
+    }
+})
+
+test("tabs.fork leaves the old tab open on a failed fork and continues with the rest", async () => {
+    const calls = []
+    const handlers = createTuiControlHandlers({
+        client: forkClient(calls, { forks: { ses_two: "ses_two_fork" }, failFor: ["ses_one"] }),
+        tabs: fakeStrip(calls),
+        data: sessionState({}),
+        log: silentLog,
+    })
+
+    const reply = await invoke(handlers, "tabs.fork", { id: "tf6" })
+    assert.deepEqual(reply.payload.failed, [{ fromSessionID: "ses_one", error: "fork refused ses_one" }])
+    assert.deepEqual(reply.payload.moves, [{ fromSessionID: "ses_two", toSessionID: "ses_two_fork" }])
+    assert.ok(
+        !calls.some((call) => call.method === "close" && call.sessionID === "ses_one"),
+        "a failed fork leaves its tab open",
+    )
+})
+
+test("tabs.fork records a missing adapter method and a fork without an id, never throwing", async () => {
+    const calls = []
+    const noMethod = createTuiControlHandlers({
+        client: forkClient(calls, { missing: true }),
+        tabs: fakeStrip(calls, { tabs: [{ sessionID: "ses_one", active: true }] }),
+        data: sessionState({}),
+        log: silentLog,
+    })
+    const missing = await invoke(noMethod, "tabs.fork", { id: "tf7" })
+    assert.equal(missing.ok, true)
+    assert.equal(missing.payload.failed.length, 1)
+    assert.equal(missing.payload.failed[0].fromSessionID, "ses_one")
+    assert.match(missing.payload.failed[0].error, /fork/)
+    assert.deepEqual(missing.payload.moves, [])
+
+    const noId = createTuiControlHandlers({
+        client: forkClient(calls, { forks: {} }),
+        tabs: fakeStrip(calls, { tabs: [{ sessionID: "ses_two", active: true }] }),
+        data: sessionState({}),
+        log: silentLog,
+    })
+    const empty = await invoke(noId, "tabs.fork", { id: "tf8" })
+    assert.deepEqual(empty.payload.failed, [
+        { fromSessionID: "ses_two", error: "session.fork returned no session id" },
+    ])
+    assert.deepEqual(empty.payload.moves, [])
+})
+
+test("tabs.fork reports a tab whose move fails and leaves the old tab open", async () => {
+    const calls = []
+    const handlers = createTuiControlHandlers({
+        client: forkClient(calls, { forks: { ses_one: "ses_one_fork" } }),
+        tabs: fakeStrip(calls, { tabs: [{ sessionID: "ses_one", active: true }], failOn: "focus" }),
+        data: sessionState({}),
+        log: silentLog,
+    })
+
+    const reply = await invoke(handlers, "tabs.fork", { id: "tf9" })
+    assert.deepEqual(reply.payload.moves, [])
+    assert.deepEqual(reply.payload.failed, [{ fromSessionID: "ses_one", error: "focus refused ses_one_fork" }])
+    assert.ok(!calls.some((call) => call.method === "close"), "the old tab is never closed after a failed move")
+})
+
+test("tabs.fork answers tabs_disabled when the strip is off, unreadable or absent", async () => {
+    const cases = [
+        fakeStrip([], { enabled: false }),
+        fakeStrip([], { enabled: "throw" }),
+        fakeStrip([], { tabs: "throw" }),
+        fakeStrip([], { tabs: "not-a-list" }),
+        null,
+    ]
+    for (const tabs of cases) {
+        const handlers = createTuiControlHandlers({
+            client: forkClient([]),
+            tabs,
+            data: sessionState({}),
+            log: silentLog,
+        })
+        const reply = await invoke(handlers, "tabs.fork", { id: "tf10" })
+        assert.deepEqual(reply, { id: "tf10", ok: false, payload: { error: { code: "tabs_disabled" } } })
+    }
 })
