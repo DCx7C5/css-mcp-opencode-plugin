@@ -22,8 +22,11 @@
  *    boot step still leaves a working publisher;
  *  - `tabs.fork` forks → opens → focuses → closes per tab, ignores draft tabs,
  *    skips a subagent child without forking or closing it, leaves the old tab
- *    open on a failed fork and continues, answers `tabs_disabled` for a strip
- *    that is off or unreadable, and replies `{moves, failed, skipped}`.
+ *    open on a failed fork and continues, verifies each close by re-reading the
+ *    strip (one retry, then the TUI's own close command), and reports a tab it
+ *    could not prove closed under `failed`/`unclosed`; answers `tabs_disabled`
+ *    for a strip that is off or unreadable, and replies `{moves, failed,
+ *    skipped, unclosed}`.
  */
 import { test } from "node:test"
 import assert from "node:assert/strict"
@@ -299,14 +302,60 @@ test("createTuiDefinition keeps a working tab publisher when a boot step throws"
 // ── tabs.fork: the whole-strip command ────────────────────────────────
 
 /**
+ * The session id of either runtime tab shape, mirroring the plugin's reader.
+ * @param {object | null | undefined} tab
+ */
+function tabSessionIDOf(tab) {
+    if (typeof tab?.sessionID === "string" && tab.sessionID) return tab.sessionID
+    const nested = typeof tab?.session === "object" && tab?.session !== null ? tab.session.id : undefined
+    return typeof nested === "string" ? nested : ""
+}
+
+/**
  * A tab strip that records every mutation into the shared `calls` array, so
  * the per-tab sequence across the client and the strip is directly assertable.
+ *
+ * The strip models its own state the way the runtime one does: `open` adds an
+ * entry, `close` removes it, and `list()` answers a fresh copy. That is what
+ * makes a "close resolved" fake distinguishable from a real removal — the fork
+ * re-reads the strip, so a fake that never removes would report every tab
+ * unclosed.
+ *
  * `enabled`/`tabs` may be the literal "throw" to exercise an unreadable strip.
+ * `failOn` makes one method throw; `refuseClose` makes `close` answer `false`
+ * and keep the tab (the silent refusal the fallback exists for); `ignoreClose`
+ * makes it answer success without removing the entry (`true` for good, a number
+ * for the first N closes — the retry then lands); `unreadableAfter` makes
+ * `list()` throw from read N+1 on, so a post-close verification cannot be
+ * proven. `remove` simulates the TUI's own close command landing on the strip.
  */
-function fakeStrip(calls, { tabs = measuredTabs, enabled = true, failOn } = {}) {
+function fakeStrip(
+    calls,
+    { tabs = measuredTabs, enabled = true, failOn, refuseClose = false, ignoreClose = false, unreadableAfter } = {},
+) {
+    const listed = Array.isArray(tabs) ? new Set(tabs.map(tabSessionIDOf).filter(Boolean)) : null
+    let reads = 0
+    let swallowed = 0
+    let refused = 0
     const record = (method) => (sessionID) => {
         calls.push({ method, sessionID })
         if (failOn === method) throw new Error(`${method} refused ${sessionID}`)
+        if (!listed) return undefined
+        if (method === "open") {
+            listed.add(sessionID)
+            return undefined
+        }
+        if (method === "close") {
+            const refusals = refuseClose === true ? Infinity : Number(refuseClose) || 0
+            if (refused < refusals) {
+                refused += 1
+                return false
+            }
+            const budget = ignoreClose === true ? Infinity : Number(ignoreClose) || 0
+            if (swallowed < budget) swallowed += 1
+            else listed.delete(sessionID)
+        }
+        return undefined
     }
     return {
         enabled() {
@@ -314,8 +363,17 @@ function fakeStrip(calls, { tabs = measuredTabs, enabled = true, failOn } = {}) 
             return enabled
         },
         list() {
+            reads += 1
             if (tabs === "throw") throw new Error("no strip")
-            return tabs
+            if (typeof unreadableAfter === "number" && reads > unreadableAfter) {
+                throw new Error("the strip went unreadable")
+            }
+            if (!listed) return tabs
+            return [...listed].map((sessionID) => ({ sessionID }))
+        },
+        /** Simulate the TUI's own `session.tab.close` command landing. */
+        remove(sessionID) {
+            listed?.delete(sessionID)
         },
         open: record("open"),
         focus: record("focus"),
@@ -324,8 +382,8 @@ function fakeStrip(calls, { tabs = measuredTabs, enabled = true, failOn } = {}) 
 }
 
 /** A client whose `session.fork` maps old ids to new ones, or refuses them. */
-function forkClient(calls, { forks = {}, failFor = [], missing = false } = {}) {
-    return {
+function forkClient(calls, { forks = {}, failFor = [], missing = false, closeCommand } = {}) {
+    const client = {
         session: missing
             ? {}
             : {
@@ -337,6 +395,17 @@ function forkClient(calls, { forks = {}, failFor = [], missing = false } = {}) {
                   },
               },
     }
+    if (closeCommand) {
+        // The v2 SDK's TUI command route, as the runtime client exposes it:
+        // `client.tui.executeCommand({ command })`.
+        client.tui = {
+            async executeCommand({ command }) {
+                calls.push({ method: "execute-command", command })
+                closeCommand(command)
+            },
+        }
+    }
+    return client
 }
 
 /** A state bus whose `session.get` answers from a literal table. */
@@ -381,6 +450,7 @@ test("tabs.fork forks, opens, focuses and closes each tab in that order", async 
             ],
             failed: [],
             skipped: [],
+            unclosed: [],
         },
     })
     assert.deepEqual(calls, [
@@ -405,7 +475,7 @@ test("tabs.fork on an empty strip answers three empty lists", async () => {
     })
 
     const reply = await invoke(handlers, "tabs.fork", { id: "tf2" })
-    assert.deepEqual(reply, { id: "tf2", ok: true, payload: { moves: [], failed: [], skipped: [] } })
+    assert.deepEqual(reply, { id: "tf2", ok: true, payload: { moves: [], failed: [], skipped: [], unclosed: [] } })
     assert.deepEqual(calls, [])
 })
 
@@ -431,6 +501,7 @@ test("tabs.fork ignores a draft tab and accepts both runtime tab shapes", async 
     ])
     assert.deepEqual(reply.payload.failed, [])
     assert.deepEqual(reply.payload.skipped, [])
+    assert.deepEqual(reply.payload.unclosed, [])
 })
 
 test("tabs.fork skips a subagent tab into `skipped` and never forks or closes it", async () => {
@@ -462,6 +533,7 @@ test("tabs.fork skips a subagent tab into `skipped` and never forks or closes it
         { fromSessionID: "ses_root", toSessionID: "ses_root_fork" },
         { fromSessionID: "ses_child_forked", toSessionID: "ses_child_forked_fork" },
     ])
+    assert.deepEqual(reply.payload.unclosed, [])
     assert.ok(
         !calls.some((call) => call.method === "fork" && call.sessionID === "ses_child"),
         "a subagent session is never forked",
@@ -484,6 +556,7 @@ test("tabs.fork treats an unclassifiable tab as a target", async () => {
         const reply = await invoke(handlers, "tabs.fork", { id: "tf5" })
         assert.deepEqual(reply.payload.moves, [{ fromSessionID: "ses_one", toSessionID: "ses_one_fork" }])
         assert.deepEqual(reply.payload.skipped, [])
+        assert.deepEqual(reply.payload.unclosed, [])
     }
 })
 
@@ -499,6 +572,7 @@ test("tabs.fork leaves the old tab open on a failed fork and continues with the 
     const reply = await invoke(handlers, "tabs.fork", { id: "tf6" })
     assert.deepEqual(reply.payload.failed, [{ fromSessionID: "ses_one", error: "fork refused ses_one" }])
     assert.deepEqual(reply.payload.moves, [{ fromSessionID: "ses_two", toSessionID: "ses_two_fork" }])
+    assert.deepEqual(reply.payload.unclosed, [])
     assert.ok(
         !calls.some((call) => call.method === "close" && call.sessionID === "ses_one"),
         "a failed fork leaves its tab open",
@@ -519,6 +593,7 @@ test("tabs.fork records a missing adapter method and a fork without an id, never
     assert.equal(missing.payload.failed[0].fromSessionID, "ses_one")
     assert.match(missing.payload.failed[0].error, /fork/)
     assert.deepEqual(missing.payload.moves, [])
+    assert.deepEqual(missing.payload.unclosed, [])
 
     const noId = createTuiControlHandlers({
         client: forkClient(calls, { forks: {} }),
@@ -531,6 +606,7 @@ test("tabs.fork records a missing adapter method and a fork without an id, never
         { fromSessionID: "ses_two", error: "session.fork returned no session id" },
     ])
     assert.deepEqual(empty.payload.moves, [])
+    assert.deepEqual(empty.payload.unclosed, [])
 })
 
 test("tabs.fork reports a tab whose move fails and leaves the old tab open", async () => {
@@ -544,8 +620,123 @@ test("tabs.fork reports a tab whose move fails and leaves the old tab open", asy
 
     const reply = await invoke(handlers, "tabs.fork", { id: "tf9" })
     assert.deepEqual(reply.payload.moves, [])
-    assert.deepEqual(reply.payload.failed, [{ fromSessionID: "ses_one", error: "focus refused ses_one_fork" }])
+    assert.deepEqual(reply.payload.failed, [
+        { fromSessionID: "ses_one", toSessionID: "ses_one_fork", step: "focus", error: "focus refused ses_one_fork" },
+    ])
+    assert.deepEqual(reply.payload.unclosed, reply.payload.failed)
     assert.ok(!calls.some((call) => call.method === "close"), "the old tab is never closed after a failed move")
+})
+
+test("tabs.fork retries a close the strip did not apply and then reports the tab moved", async () => {
+    const calls = []
+    const handlers = createTuiControlHandlers({
+        client: forkClient(calls, { forks: { ses_one: "ses_one_fork" } }),
+        // The first close resolves without removing the entry; the retry lands.
+        tabs: fakeStrip(calls, { tabs: [{ sessionID: "ses_one", active: true }], ignoreClose: 1 }),
+        data: sessionState({}),
+        log: silentLog,
+    })
+
+    const reply = await invoke(handlers, "tabs.fork", { id: "tf11" })
+    assert.deepEqual(reply.payload.moves, [{ fromSessionID: "ses_one", toSessionID: "ses_one_fork" }])
+    assert.deepEqual(reply.payload.failed, [])
+    assert.deepEqual(reply.payload.unclosed, [])
+    assert.deepEqual(
+        calls.filter((call) => call.method === "close").length,
+        2,
+        "a close that did not take effect is retried exactly once",
+    )
+})
+
+test("tabs.fork falls back to the TUI close command when the strip ignores close", async () => {
+    const calls = []
+    const strip = fakeStrip(calls, { tabs: [{ sessionID: "ses_one", active: true }], ignoreClose: true })
+    const handlers = createTuiControlHandlers({
+        client: forkClient(calls, {
+            forks: { ses_one: "ses_one_fork" },
+            closeCommand: (command) => {
+                assert.equal(command, "session.tab.close")
+                strip.remove("ses_one")
+            },
+        }),
+        tabs: strip,
+        data: sessionState({}),
+        log: silentLog,
+    })
+
+    const reply = await invoke(handlers, "tabs.fork", { id: "tf12" })
+    assert.deepEqual(reply.payload.moves, [{ fromSessionID: "ses_one", toSessionID: "ses_one_fork" }])
+    assert.deepEqual(reply.payload.unclosed, [])
+    assert.deepEqual(calls, [
+        { method: "fork", sessionID: "ses_one" },
+        { method: "open", sessionID: "ses_one_fork" },
+        { method: "focus", sessionID: "ses_one_fork" },
+        { method: "close", sessionID: "ses_one" },
+        { method: "close", sessionID: "ses_one" },
+        { method: "focus", sessionID: "ses_one" },
+        { method: "execute-command", command: "session.tab.close" },
+    ])
+})
+
+test("tabs.fork reports a tab unclosed when neither close path removes it", async () => {
+    const calls = []
+    const handlers = createTuiControlHandlers({
+        client: forkClient(calls, { forks: { ses_one: "ses_one_fork" } }),
+        tabs: fakeStrip(calls, { tabs: [{ sessionID: "ses_one", active: true }], ignoreClose: true }),
+        data: sessionState({}),
+        log: silentLog,
+    })
+
+    const reply = await invoke(handlers, "tabs.fork", { id: "tf13" })
+    assert.deepEqual(reply.payload.moves, [])
+    assert.deepEqual(reply.payload.failed, [
+        {
+            fromSessionID: "ses_one",
+            toSessionID: "ses_one_fork",
+            step: "close",
+            error: "tab ses_one is still listed after close",
+        },
+    ])
+    assert.deepEqual(reply.payload.unclosed, reply.payload.failed)
+})
+
+test("tabs.fork treats a close that answers false as unclosed", async () => {
+    const calls = []
+    const handlers = createTuiControlHandlers({
+        client: forkClient(calls, { forks: { ses_one: "ses_one_fork" } }),
+        tabs: fakeStrip(calls, { tabs: [{ sessionID: "ses_one", active: true }], refuseClose: true }),
+        data: sessionState({}),
+        log: silentLog,
+    })
+
+    const reply = await invoke(handlers, "tabs.fork", { id: "tf14" })
+    assert.deepEqual(reply.payload.moves, [])
+    assert.deepEqual(reply.payload.failed, [
+        {
+            fromSessionID: "ses_one",
+            toSessionID: "ses_one_fork",
+            step: "close",
+            error: "tabs.close refused ses_one",
+        },
+    ])
+    assert.deepEqual(reply.payload.unclosed, reply.payload.failed)
+})
+
+test("tabs.fork treats a strip it cannot re-read as unclosed", async () => {
+    const calls = []
+    const handlers = createTuiControlHandlers({
+        client: forkClient(calls, { forks: { ses_one: "ses_one_fork" } }),
+        // Read 1 is the snapshot; every verification read throws.
+        tabs: fakeStrip(calls, { tabs: [{ sessionID: "ses_one", active: true }], unreadableAfter: 1 }),
+        data: sessionState({}),
+        log: silentLog,
+    })
+
+    const reply = await invoke(handlers, "tabs.fork", { id: "tf15" })
+    assert.deepEqual(reply.payload.moves, [])
+    assert.equal(reply.payload.unclosed.length, 1)
+    assert.equal(reply.payload.unclosed[0].step, "close")
+    assert.match(reply.payload.unclosed[0].error, /unreadable/)
 })
 
 test("tabs.fork answers tabs_disabled when the strip is off, unreadable or absent", async () => {
