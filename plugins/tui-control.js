@@ -325,10 +325,12 @@ function closeLeftover(tabs, sessionID) {
  * mechanism — there is no close route on the TUI HTTP API. Its resolution is
  * not proof (a strip may queue the removal, or answer `false` and keep the
  * tab), so the strip is re-read and the close retried once after a short
- * settle. Only then is the last resort used: focus the old tab and run the
- * TUI's own `session.tab.close` command (the default `<leader>w` action), then
- * re-read once more. The v2 SDK exposes that as `client.tui.executeCommand`;
- * on a client without it the fallback is skipped rather than invented.
+ * settle. Only then is the last resort used: focus the old tab — a refused
+ * focus skips the command, because it would close whichever tab currently has
+ * focus — and run the TUI's own `session.tab.close` command (the default
+ * `<leader>w` action), then re-read once more. The v2 SDK exposes that as
+ * `client.tui.executeCommand`; on a client without it the fallback is skipped
+ * rather than invented.
  *
  * Returns the remaining reason the tab is still listed, or `null` when it is
  * provably gone, plus the mechanism that closed it for the caller's debug line.
@@ -369,7 +371,14 @@ async function closeTab(client, tabs, sessionID, debug) {
     }
     debug(`tabs.fork: ${sessionID} still open; focusing it for the TUI close command`)
     try {
-        await tabs.focus(sessionID)
+        if ((await tabs.focus(sessionID)) === false) {
+            // `session.tab.close` closes whichever tab is focused: sending it
+            // without the old tab focused would close a different one.
+            return {
+                leftover: `${leftover}; tabs.focus refused ${sessionID}, so the close command was not sent`,
+                mechanism: null,
+            }
+        }
         await call(() => executeCommand.call(client.tui, { command: "session.tab.close" }))
     } catch (error) {
         return { leftover: `${leftover}; execute-command failed: ${messageOf(error)}`, mechanism: null }
@@ -390,7 +399,8 @@ async function closeTab(client, tabs, sessionID, debug) {
  *
  * A move is three measured steps — `open`, `focus`, `close` — and a tab only
  * lands in `moves` when all three succeeded AND a re-read of the strip no
- * longer lists the old id. `close()` resolving is not proof: a strip may queue
+ * longer lists the old id. A step that throws or answers `false` is that
+ * step's failure. `close()` resolving is not proof: a strip may queue
  * the removal or answer `false` and keep the tab, so while the old id is still
  * there the close is retried once after a short settle, and only then does the
  * last resort run — focus the old tab and execute the TUI's own
@@ -453,25 +463,39 @@ async function forkTabs(client, tabs, data, debug) {
             continue
         }
 
-        // Open and focus are measured steps: the one that threw is where the
-        // tab stopped, and the old tab is still open either way.
+        // Open and focus are measured steps: the one that threw or answered
+        // `false` is where the tab stopped, and the old tab is still open
+        // either way. A `false` from `open` means no new tab exists; a `false`
+        // from `focus` means the fork tab is open but was not focused.
         let opened = false
         let focused = false
+        let stoppedAt = null
+        let reason = null
         try {
-            await tabs.open(toSessionID)
-            opened = true
-            debug(`tabs.fork: ${fromSessionID} → ${toSessionID} open=ok`)
-            await tabs.focus(toSessionID)
-            focused = true
-            debug(`tabs.fork: ${fromSessionID} → ${toSessionID} open=ok focus=ok`)
+            if ((await tabs.open(toSessionID)) === false) {
+                stoppedAt = "open"
+                reason = `tabs.open refused ${toSessionID}`
+            } else {
+                opened = true
+                debug(`tabs.fork: ${fromSessionID} → ${toSessionID} open=ok`)
+                if ((await tabs.focus(toSessionID)) === false) {
+                    stoppedAt = "focus"
+                    reason = `tabs.focus refused ${toSessionID}`
+                } else {
+                    focused = true
+                    debug(`tabs.fork: ${fromSessionID} → ${toSessionID} open=ok focus=ok`)
+                }
+            }
         } catch (error) {
-            const step = opened ? "focus" : "open"
-            const reason = messageOf(error)
+            stoppedAt = opened ? "focus" : "open"
+            reason = messageOf(error)
+        }
+        if (stoppedAt) {
             debug(
-                `tabs.fork: ${fromSessionID} → ${toSessionID} stopped at ${step} (open=${opened} focus=${focused}): ${reason}`,
+                `tabs.fork: ${fromSessionID} → ${toSessionID} stopped at ${stoppedAt} (open=${opened} focus=${focused}): ${reason}`,
             )
-            failed.push({ fromSessionID, toSessionID, step, error: reason })
-            unclosed.push({ fromSessionID, toSessionID, step, error: reason })
+            failed.push({ fromSessionID, toSessionID, step: stoppedAt, error: reason })
+            unclosed.push({ fromSessionID, toSessionID, step: stoppedAt, error: reason })
             continue
         }
 

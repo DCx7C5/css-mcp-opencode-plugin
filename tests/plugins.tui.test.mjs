@@ -22,11 +22,12 @@
  *    boot step still leaves a working publisher;
  *  - `tabs.fork` forks → opens → focuses → closes per tab, ignores draft tabs,
  *    skips a subagent child without forking or closing it, leaves the old tab
- *    open on a failed fork and continues, verifies each close by re-reading the
- *    strip (one retry, then the TUI's own close command), and reports a tab it
- *    could not prove closed under `failed`/`unclosed`; answers `tabs_disabled`
- *    for a strip that is off or unreadable, and replies `{moves, failed,
- *    skipped, unclosed}`.
+ *    open on a failed fork and continues, treats a step that throws or answers
+ *    `false` as that step's failure, verifies each close by re-reading the
+ *    strip (one retry, then the TUI's own close command — skipped when the old
+ *    tab cannot be focused), and reports a tab it could not prove closed under
+ *    `failed`/`unclosed`; answers `tabs_disabled` for a strip that is off or
+ *    unreadable, and replies `{moves, failed, skipped, unclosed}`.
  */
 import { test } from "node:test"
 import assert from "node:assert/strict"
@@ -322,24 +323,41 @@ function tabSessionIDOf(tab) {
  * unclosed.
  *
  * `enabled`/`tabs` may be the literal "throw" to exercise an unreadable strip.
- * `failOn` makes one method throw; `refuseClose` makes `close` answer `false`
- * and keep the tab (the silent refusal the fallback exists for); `ignoreClose`
- * makes it answer success without removing the entry (`true` for good, a number
- * for the first N closes — the retry then lands); `unreadableAfter` makes
- * `list()` throw from read N+1 on, so a post-close verification cannot be
- * proven. `remove` simulates the TUI's own close command landing on the strip.
+ * `failOn` makes one method throw; `refuseOn` makes the named method(s) answer
+ * `false` and change nothing (a string, an array, or a `(method, sessionID) =>
+ * boolean` predicate — the predicate is what refuses the fallback's focus of
+ * one specific tab); `refuseClose` makes `close` answer `false` and keep the
+ * tab (the silent refusal the fallback exists for); `ignoreClose` makes it
+ * answer success without removing the entry (`true` for good, a number for the
+ * first N closes — the retry then lands); `unreadableAfter` makes `list()`
+ * throw from read N+1 on, so a post-close verification cannot be proven.
+ * `remove` simulates the TUI's own close command landing on the strip.
  */
 function fakeStrip(
     calls,
-    { tabs = measuredTabs, enabled = true, failOn, refuseClose = false, ignoreClose = false, unreadableAfter } = {},
+    {
+        tabs = measuredTabs,
+        enabled = true,
+        failOn,
+        refuseOn = [],
+        refuseClose = false,
+        ignoreClose = false,
+        unreadableAfter,
+    } = {},
 ) {
     const listed = Array.isArray(tabs) ? new Set(tabs.map(tabSessionIDOf).filter(Boolean)) : null
     let reads = 0
     let swallowed = 0
     let refused = 0
+    const refuses = (method, sessionID) => {
+        if (typeof refuseOn === "function") return refuseOn(method, sessionID) === true
+        const methods = Array.isArray(refuseOn) ? refuseOn : [refuseOn]
+        return methods.includes(method)
+    }
     const record = (method) => (sessionID) => {
         calls.push({ method, sessionID })
         if (failOn === method) throw new Error(`${method} refused ${sessionID}`)
+        if (refuses(method, sessionID)) return false
         if (!listed) return undefined
         if (method === "open") {
             listed.add(sessionID)
@@ -627,6 +645,47 @@ test("tabs.fork reports a tab whose move fails and leaves the old tab open", asy
     assert.ok(!calls.some((call) => call.method === "close"), "the old tab is never closed after a failed move")
 })
 
+test("tabs.fork reports a tab failed at open when the strip answers false", async () => {
+    const calls = []
+    const handlers = createTuiControlHandlers({
+        client: forkClient(calls, { forks: { ses_one: "ses_one_fork" } }),
+        tabs: fakeStrip(calls, { tabs: [{ sessionID: "ses_one", active: true }], refuseOn: "open" }),
+        data: sessionState({}),
+        log: silentLog,
+    })
+
+    const reply = await invoke(handlers, "tabs.fork", { id: "tf16" })
+    assert.deepEqual(reply.payload.moves, [])
+    assert.deepEqual(reply.payload.failed, [
+        { fromSessionID: "ses_one", toSessionID: "ses_one_fork", step: "open", error: "tabs.open refused ses_one_fork" },
+    ])
+    assert.deepEqual(reply.payload.unclosed, reply.payload.failed)
+    assert.ok(!calls.some((call) => call.method === "focus"), "focus never runs when the new tab was not opened")
+})
+
+test("tabs.fork reports a tab failed at focus when the strip answers false", async () => {
+    const calls = []
+    const handlers = createTuiControlHandlers({
+        client: forkClient(calls, { forks: { ses_one: "ses_one_fork" } }),
+        tabs: fakeStrip(calls, { tabs: [{ sessionID: "ses_one", active: true }], refuseOn: "focus" }),
+        data: sessionState({}),
+        log: silentLog,
+    })
+
+    const reply = await invoke(handlers, "tabs.fork", { id: "tf17" })
+    assert.deepEqual(reply.payload.moves, [])
+    assert.deepEqual(reply.payload.failed, [
+        {
+            fromSessionID: "ses_one",
+            toSessionID: "ses_one_fork",
+            step: "focus",
+            error: "tabs.focus refused ses_one_fork",
+        },
+    ])
+    assert.deepEqual(reply.payload.unclosed, reply.payload.failed)
+    assert.ok(!calls.some((call) => call.method === "close"), "the old tab is not closed when the fork tab was never focused")
+})
+
 test("tabs.fork retries a close the strip did not apply and then reports the tab moved", async () => {
     const calls = []
     const handlers = createTuiControlHandlers({
@@ -676,6 +735,32 @@ test("tabs.fork falls back to the TUI close command when the strip ignores close
         { method: "focus", sessionID: "ses_one" },
         { method: "execute-command", command: "session.tab.close" },
     ])
+})
+
+test("tabs.fork skips the TUI close command when focusing the old tab is refused", async () => {
+    const calls = []
+    const handlers = createTuiControlHandlers({
+        client: forkClient(calls, { forks: { ses_one: "ses_one_fork" }, closeCommand: () => {} }),
+        tabs: fakeStrip(calls, {
+            tabs: [{ sessionID: "ses_one", active: true }],
+            ignoreClose: true,
+            // The fork tab focuses fine; only the fallback's focus of the OLD tab is refused.
+            refuseOn: (method, sessionID) => method === "focus" && sessionID === "ses_one",
+        }),
+        data: sessionState({}),
+        log: silentLog,
+    })
+
+    const reply = await invoke(handlers, "tabs.fork", { id: "tf18" })
+    assert.deepEqual(reply.payload.moves, [])
+    assert.equal(reply.payload.unclosed.length, 1)
+    assert.equal(reply.payload.unclosed[0].step, "close")
+    assert.match(reply.payload.unclosed[0].error, /tabs\.focus refused ses_one/)
+    assert.match(reply.payload.unclosed[0].error, /close command was not sent/)
+    assert.ok(
+        !calls.some((call) => call.method === "execute-command"),
+        "session.tab.close must not run without the old tab focused",
+    )
 })
 
 test("tabs.fork reports a tab unclosed when neither close path removes it", async () => {
