@@ -139,7 +139,7 @@ function readTabs(context) {
  * bootstrap owns the pool before the first publish opens the socket, and with
  * NO client so this side's `activeClient` stays null: the server-part built-ins
  * answer `no_client` rather than acting on a client the TUI process must not
- * drive. `registerTuiControl` then subscribes the five push channels to the
+ * drive. `registerTuiControl` then subscribes the six push channels to the
  * context's own client, strip and state bus, and only then does the tab
  * publisher's setup run; its cleanup is the definition's cleanup.
  *

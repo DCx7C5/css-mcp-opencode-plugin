@@ -423,7 +423,7 @@ test("a throwing reply never escapes a handler", async () => {
     })
 })
 
-test("registerTuiControl registers all five channels on the shared onPush registry", () => {
+test("registerTuiControl registers all six channels on the shared onPush registry", () => {
     const { client } = fakeClient()
     const { log } = fakeLog()
     const handlers = registerTuiControl({ client, tabs: {}, data: {}, log })
@@ -433,6 +433,7 @@ test("registerTuiControl registers all five channels on the shared onPush regist
         "credential.remove",
         "session.fork",
         "session.prompt",
+        "tabs.close",
         "tabs.fork",
     ])
     assert.throws(() => registerTuiControl({ client }), /already has a handler/)

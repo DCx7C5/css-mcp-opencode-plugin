@@ -843,3 +843,145 @@ test("tabs.fork answers tabs_disabled when the strip is off, unreadable or absen
         assert.deepEqual(reply, { id: "tf10", ok: false, payload: { error: { code: "tabs_disabled" } } })
     }
 })
+
+// ── tabs.close: the single-tab close command ─────────────────────────
+
+test("tabs.close removes one id from the strip and proves it left", async () => {
+    const calls = []
+    const strip = fakeStrip(calls, { tabs: measuredTabs })
+    const handlers = createTuiControlHandlers({
+        client: forkClient(calls),
+        tabs: strip,
+        data: sessionState({}),
+        log: silentLog,
+    })
+
+    const reply = await invoke(handlers, "tabs.close", { id: "tc1", sessionID: "ses_one" })
+    assert.deepEqual(reply, {
+        id: "tc1",
+        ok: true,
+        payload: { sessionID: "ses_one", mechanism: "tabs.close" },
+    })
+    assert.deepEqual(
+        strip.list().map((tab) => tab.sessionID),
+        ["ses_two"],
+        "the closed id is gone from the strip and the other tab is untouched",
+    )
+    assert.deepEqual(calls, [{ method: "close", sessionID: "ses_one" }])
+})
+
+test("tabs.close is idempotent for an id the strip no longer lists", async () => {
+    const calls = []
+    const handlers = createTuiControlHandlers({
+        client: forkClient(calls),
+        tabs: fakeStrip(calls, { tabs: measuredTabs }),
+        data: sessionState({}),
+        log: silentLog,
+    })
+
+    const reply = await invoke(handlers, "tabs.close", { id: "tc2", sessionID: "ses_gone" })
+    assert.deepEqual(reply, {
+        id: "tc2",
+        ok: true,
+        payload: { sessionID: "ses_gone", mechanism: null },
+    })
+    assert.deepEqual(calls, [], "an absent tab is the goal state, never a close attempt")
+})
+
+test("tabs.close retries a close the strip did not apply", async () => {
+    const calls = []
+    const handlers = createTuiControlHandlers({
+        client: forkClient(calls),
+        // The first close resolves without removing the entry; the retry lands.
+        tabs: fakeStrip(calls, { tabs: [{ sessionID: "ses_one", active: true }], ignoreClose: 1 }),
+        data: sessionState({}),
+        log: silentLog,
+    })
+
+    const reply = await invoke(handlers, "tabs.close", { id: "tc3", sessionID: "ses_one" })
+    assert.equal(reply.ok, true)
+    assert.equal(reply.payload.mechanism, "tabs.close")
+    assert.equal(calls.filter((call) => call.method === "close").length, 2)
+})
+
+test("tabs.close falls back to the TUI close command when the strip ignores close", async () => {
+    const calls = []
+    const strip = fakeStrip(calls, { tabs: [{ sessionID: "ses_one", active: true }], ignoreClose: true })
+    const handlers = createTuiControlHandlers({
+        client: forkClient(calls, {
+            closeCommand: (command) => {
+                assert.equal(command, "session.tab.close")
+                strip.remove("ses_one")
+            },
+        }),
+        tabs: strip,
+        data: sessionState({}),
+        log: silentLog,
+    })
+
+    const reply = await invoke(handlers, "tabs.close", { id: "tc4", sessionID: "ses_one" })
+    assert.equal(reply.ok, true)
+    assert.equal(reply.payload.mechanism, "execute-command")
+    assert.deepEqual(calls, [
+        { method: "close", sessionID: "ses_one" },
+        { method: "close", sessionID: "ses_one" },
+        { method: "focus", sessionID: "ses_one" },
+        { method: "execute-command", command: "session.tab.close" },
+    ])
+})
+
+test("tabs.close reports close_unverified when neither path removes the tab", async () => {
+    const calls = []
+    const handlers = createTuiControlHandlers({
+        client: forkClient(calls),
+        tabs: fakeStrip(calls, { tabs: [{ sessionID: "ses_one", active: true }], ignoreClose: true }),
+        data: sessionState({}),
+        log: silentLog,
+    })
+
+    const reply = await invoke(handlers, "tabs.close", { id: "tc5", sessionID: "ses_one" })
+    assert.equal(reply.ok, false)
+    assert.equal(reply.payload.error.code, "close_unverified")
+    assert.equal(reply.payload.error.message, "tab ses_one is still listed after close")
+    assert.equal(reply.payload.sessionID, "ses_one")
+})
+
+test("tabs.close requires a session id", async () => {
+    const handlers = createTuiControlHandlers({
+        client: forkClient([]),
+        tabs: fakeStrip([]),
+        data: sessionState({}),
+        log: silentLog,
+    })
+
+    for (const body of [{ id: "tc6" }, { id: "tc6", sessionID: "" }, { id: "tc6", sessionID: 42 }]) {
+        const reply = await invoke(handlers, "tabs.close", body)
+        assert.equal(reply.ok, false)
+        assert.equal(reply.payload.error.code, "call_failed")
+        assert.match(reply.payload.error.message, /sessionID is required/)
+    }
+})
+
+test("tabs.close answers tabs_disabled when the strip is off, unreadable or absent", async () => {
+    const cases = [
+        fakeStrip([], { enabled: false }),
+        fakeStrip([], { enabled: "throw" }),
+        fakeStrip([], { tabs: "throw" }),
+        fakeStrip([], { tabs: "not-a-list" }),
+        null,
+    ]
+    for (const tabs of cases) {
+        const handlers = createTuiControlHandlers({
+            client: forkClient([]),
+            tabs,
+            data: sessionState({}),
+            log: silentLog,
+        })
+        const reply = await invoke(handlers, "tabs.close", { id: "tc7", sessionID: "ses_one" })
+        assert.deepEqual(reply, {
+            id: "tc7",
+            ok: false,
+            payload: { error: { code: "tabs_disabled" }, sessionID: "ses_one" },
+        })
+    }
+})

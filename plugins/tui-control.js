@@ -5,8 +5,9 @@
  * These channels run in the TUI plugin process: it is the only context whose
  * `process.env` carries the `OPENCODE_API_KEY*` values, so credential
  * install/remove must be answered here, and the only one that owns a tab
- * strip, so `tabs.fork` is answered here too. The server process never sees
- * those values, which is also why a key never crosses the wire:
+ * strip, so `tabs.fork` and `tabs.close` are answered here too. The server
+ * process never sees those values, which is also why a key never crosses the
+ * wire:
  * `credential.install` reads it from the local environment and only ever
  * sends it straight to the adapter's `credential.create`; `credential.remove`
  * discovers its target from the adapter listing and never accepts an id or a
@@ -389,6 +390,60 @@ async function closeTab(client, tabs, sessionID, debug) {
 }
 
 /**
+ * Close one tab by session id and prove it left the strip.
+ *
+ * The brain's fork undo needs the strip to lose a duplicate the session tree
+ * alone cannot remove (row 2572): a re-parented copy carries the fork marker,
+ * so `isSubagentSession` still reads it as a tab and the next rotation would
+ * fork it again. This channel is the wire path that removes it, and it reuses
+ * `closeTab` — the same verified close `tabs.fork` runs per tab — so the strip
+ * has one close mechanism, never a second.
+ *
+ * Idempotent on purpose: an id the strip no longer lists is the goal state,
+ * not a refusal, so a retry after a lost reply answers `ok` instead of
+ * reporting `tabs.close refused`. A strip that is off or unreadable answers
+ * `tabs_disabled`, exactly like `tabs.fork`.
+ *
+ * @param {object} client
+ * @param {object | null | undefined} tabs
+ * @param {object} body
+ * @param {(message: string) => void} debug
+ */
+async function closeSessionTab(client, tabs, body, debug) {
+    const sessionID = typeof body?.sessionID === "string" ? body.sessionID : ""
+    if (!sessionID) return failure("call_failed", { message: "tabs.close: sessionID is required" })
+
+    let listed
+    try {
+        if (typeof tabs?.enabled !== "function" || !tabs.enabled()) {
+            debug("tabs.close: the tab strip is disabled")
+            return failure("tabs_disabled", {}, { sessionID })
+        }
+        const list = tabs.list()
+        if (!Array.isArray(list)) {
+            debug("tabs.close: the tab strip returned no list")
+            return failure("tabs_disabled", {}, { sessionID })
+        }
+        listed = list.some((tab) => tabSessionID(tab) === sessionID)
+    } catch {
+        debug("tabs.close: the tab strip is not readable")
+        return failure("tabs_disabled", {}, { sessionID })
+    }
+    if (!listed) {
+        debug(`tabs.close: ${sessionID} is not on the strip`)
+        return success({ sessionID, mechanism: null })
+    }
+
+    const closed = await closeTab(client, tabs, sessionID, debug)
+    if (closed.leftover) {
+        debug(`tabs.close: ${sessionID} still open: ${closed.leftover}`)
+        return failure("close_unverified", { message: closed.leftover }, { sessionID })
+    }
+    debug(`tabs.close: ${sessionID} closed (via ${closed.mechanism})`)
+    return success({ sessionID, mechanism: closed.mechanism })
+}
+
+/**
  * Fork every open tab's session and move its tab onto the fork.
  *
  * The body is ignored — the strip is this side's state, so the brain only
@@ -572,9 +627,9 @@ const handlerFor = (implementation) => async (body, reply) => {
  *
  * `tabs` and `data` are the TUI context's own tab strip (`ui.tabs`) and state
  * bus: `tabs.fork` mutates the strip and classifies each tab's session through
- * `data.session.get`. Without them the channel answers `tabs_disabled` instead
- * of throwing — a missing strip is a state the brain is told about, never a
- * crash in the TUI.
+ * `data.session.get`; `tabs.close` removes one id from it. Without them the
+ * channels answer `tabs_disabled` instead of throwing — a missing strip is a
+ * state the brain is told about, never a crash in the TUI.
  *
  * @param {{ client?: object, tabs?: object, data?: object, log?: { debug?: (message: string) => void } }} [input]
  * @returns {Record<string, (body: object, reply: (id: string, ok: boolean, payload?: object) => void) => Promise<void>>}
@@ -592,6 +647,7 @@ export function createTuiControlHandlers({ client, tabs, data, log } = {}) {
         "credential.install": handlerFor((body) => installCredential(client, body, debug)),
         "session.fork": handlerFor((body) => forkSession(client, body)),
         "session.prompt": handlerFor((body) => promptSession(client, body)),
+        "tabs.close": handlerFor((body) => closeSessionTab(client, tabs, body, debug)),
         "tabs.fork": handlerFor(() => forkTabs(client, tabs, data, debug)),
     }
 }
