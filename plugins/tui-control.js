@@ -320,6 +320,61 @@ function closeLeftover(tabs, sessionID) {
 }
 
 /**
+ * The strip's stored ids as one debug token: the exact values the manager's
+ * close lookup compares against, so an id the plugin passed but the strip
+ * stores under another value is visible in the log. A strip that cannot be
+ * read says so, never throws.
+ *
+ * @param {object} tabs
+ * @returns {string}
+ */
+function stripIDs(tabs) {
+    try {
+        const list = tabs.list()
+        if (!Array.isArray(list)) return "unreadable"
+        return list.map((tab) => tabSessionID(tab) || "<draft>").join(",") || "empty"
+    } catch {
+        return "unreadable"
+    }
+}
+
+/**
+ * The strip plus the session facts the manager's root resolution reads.
+ *
+ * `parentID` is what the manager's root walk reads; `fork` is printed beside
+ * it so the log distinguishes the tab root from the provider-affinity
+ * resolver (`parentID ?? fork?.sessionID ?? id`), which is not the one the
+ * strip uses.
+ *
+ * @param {object} tabs
+ * @param {object | null | undefined} data
+ * @returns {string}
+ */
+function describeStrip(tabs, data) {
+    try {
+        const list = tabs.list()
+        if (!Array.isArray(list)) return "strip=unreadable"
+        const rows = list.map((tab) => {
+            const id = tabSessionID(tab)
+            if (!id) return "<draft>"
+            let parentID
+            let forkID
+            try {
+                const session = data?.session?.get?.(id)
+                parentID = session?.parentID
+                forkID = session?.fork?.sessionID
+            } catch {
+                // The id still gets listed when the session store cannot answer.
+            }
+            return `${id}(parent=${parentID ?? "-"},fork=${forkID ?? "-"})`
+        })
+        return `strip=[${rows.join(",")}]`
+    } catch {
+        return "strip=unreadable"
+    }
+}
+
+/**
  * Close one old tab and prove it left the strip.
  *
  * `tabs.close(sessionID)` is the documented plugin path and stays the primary
@@ -358,11 +413,14 @@ async function closeTab(client, tabs, sessionID, debug) {
         return leftover
     }
 
+    debug(`tabs.close: ${sessionID} before=${stripIDs(tabs)}`)
     let leftover = await attempt("tabs.close")
+    debug(`tabs.close: ${sessionID} after=${stripIDs(tabs)} (${leftover ?? "gone"})`)
     if (leftover === null) return { leftover: null, mechanism }
     debug(`tabs.fork: ${sessionID} not closed by tabs.close (${leftover}), retrying once`)
     await settle(TAB_CLOSE_SETTLE_MS)
     leftover = await attempt("tabs.close")
+    debug(`tabs.close: ${sessionID} after-retry=${stripIDs(tabs)} (${leftover ?? "gone"})`)
     if (leftover === null) return { leftover: null, mechanism }
 
     const executeCommand = client?.tui?.executeCommand
@@ -491,6 +549,9 @@ async function forkTabs(client, tabs, data, debug) {
         debug("tabs.fork: the tab strip returned no list")
         return failure("tabs_disabled")
     }
+    // The strip and the session facts the manager's root lookup reads: a close
+    // that names an id the strip stores under another root is visible here.
+    debug(`tabs.fork: ${describeStrip(tabs, data)}`)
 
     const moves = []
     const failed = []
