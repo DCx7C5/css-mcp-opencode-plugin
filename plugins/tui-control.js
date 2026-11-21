@@ -377,40 +377,49 @@ function describeStrip(tabs, data) {
 /**
  * Close one old tab and prove it left the strip.
  *
- * `tabs.close(sessionID)` is the documented plugin path and stays the primary
- * mechanism — there is no close route on the TUI HTTP API. Its resolution is
- * not proof (a strip may queue the removal, or answer `false` and keep the
- * tab), so the strip is re-read and the close retried once after a short
- * settle. Only then is the last resort used: focus the old tab — a refused
- * focus skips the command, because it would close whichever tab currently has
- * focus — and run the TUI's own `session.tab.close` command (the default
- * `<leader>w` action), then re-read once more. The v2 SDK exposes that as
- * `client.tui.executeCommand`; on a client without it the fallback is skipped
- * rather than invented.
+ * `tabs.close(sessionID)` — `context.ui.tabs.close` in the TUI plugin API — is
+ * the only close mechanism. It is documented as returning `false` when no tab
+ * matched, and there is no second route: the TUI plugin's `client` is an
+ * `OpenCodeClient` with no `tui` namespace (measured on `@opencode/client`
+ * 2.1.4), so the old `client.tui.executeCommand({ command: "session.tab.close" })`
+ * fallback could never run and was removed rather than left as dead code.
+ *
+ * Its resolution is not proof (a strip may queue the removal, or answer `false`
+ * and keep the tab), so the strip is re-read and the close retried once after a
+ * short settle; a refusal on an id the strip no longer lists is the goal state,
+ * because the fork's `open` can re-root that entry before the close runs.
  *
  * Returns the remaining reason the tab is still listed, or `null` when it is
  * provably gone, plus the mechanism that closed it for the caller's debug line.
  *
- * @param {object} client
  * @param {object} tabs
  * @param {string} sessionID
  * @param {(message: string) => void} debug
- * @returns {Promise<{ leftover: string | null, mechanism: "tabs.close" | "execute-command" | null }>}
+ * @returns {Promise<{ leftover: string | null, mechanism: "tabs.close" | null }>}
  */
-async function closeTab(client, tabs, sessionID, debug) {
-    /** @type {"tabs.close" | "execute-command" | null} */
+async function closeTab(tabs, sessionID, debug) {
+    /** @type {"tabs.close" | null} */
     let mechanism = null
 
     /** @param {"tabs.close"} label */
     const attempt = async (label) => {
+        let refused = false
         try {
-            if ((await tabs.close(sessionID)) === false) return `tabs.close refused ${sessionID}`
+            if ((await tabs.close(sessionID)) === false) refused = true
         } catch (error) {
             return messageOf(error)
         }
+        // `tabs.close` answers `false` when no tab matched, which is also what
+        // it answers for an id the strip no longer lists — and the fork's
+        // `open` can re-root that strip entry before this close runs. The strip
+        // is the truth: a refusal on an id that is already gone is the goal
+        // state, not a failure.
         const leftover = closeLeftover(tabs, sessionID)
-        if (leftover === null) mechanism = label
-        return leftover
+        if (leftover === null) {
+            mechanism = label
+            return null
+        }
+        return refused ? `tabs.close refused ${sessionID}` : leftover
     }
 
     debug(`tabs.close: ${sessionID} before=${stripIDs(tabs)}`)
@@ -421,29 +430,6 @@ async function closeTab(client, tabs, sessionID, debug) {
     await settle(TAB_CLOSE_SETTLE_MS)
     leftover = await attempt("tabs.close")
     debug(`tabs.close: ${sessionID} after-retry=${stripIDs(tabs)} (${leftover ?? "gone"})`)
-    if (leftover === null) return { leftover: null, mechanism }
-
-    const executeCommand = client?.tui?.executeCommand
-    if (typeof executeCommand !== "function") {
-        debug(`tabs.fork: ${sessionID} still open; this client has no execute-command`)
-        return { leftover, mechanism: null }
-    }
-    debug(`tabs.fork: ${sessionID} still open; focusing it for the TUI close command`)
-    try {
-        if ((await tabs.focus(sessionID)) === false) {
-            // `session.tab.close` closes whichever tab is focused: sending it
-            // without the old tab focused would close a different one.
-            return {
-                leftover: `${leftover}; tabs.focus refused ${sessionID}, so the close command was not sent`,
-                mechanism: null,
-            }
-        }
-        await call(() => executeCommand.call(client.tui, { command: "session.tab.close" }))
-    } catch (error) {
-        return { leftover: `${leftover}; execute-command failed: ${messageOf(error)}`, mechanism: null }
-    }
-    leftover = closeLeftover(tabs, sessionID)
-    if (leftover === null) mechanism = "execute-command"
     return { leftover, mechanism }
 }
 
@@ -464,12 +450,11 @@ async function closeTab(client, tabs, sessionID, debug) {
  * reporting `tabs.close refused`. A strip that is off or unreadable answers
  * `tabs_disabled`, exactly like `tabs.fork`.
  *
- * @param {object} client
  * @param {object | null | undefined} tabs
  * @param {object} body
  * @param {(message: string) => void} debug
  */
-async function closeSessionTab(client, tabs, body, debug) {
+async function closeSessionTab(tabs, body, debug) {
     const sessionID = typeof body?.sessionID === "string" ? body.sessionID : ""
     if (!sessionID) return failure("call_failed", { message: "tabs.close: sessionID is required" })
 
@@ -494,7 +479,7 @@ async function closeSessionTab(client, tabs, body, debug) {
         return success({ sessionID, mechanism: null })
     }
 
-    const closed = await closeTab(client, tabs, sessionID, debug)
+    const closed = await closeTab(tabs, sessionID, debug)
     if (closed.leftover) {
         debug(`tabs.close: ${sessionID} still open: ${closed.leftover}`)
         return failure("close_unverified", { message: closed.leftover }, { sessionID })
@@ -534,11 +519,10 @@ async function closeSessionTab(client, tabs, body, debug) {
  *
  * The close is the same verified path as `tabs.close`: `close()` resolving is
  * not proof (a strip may queue the removal or answer `false` and keep the
- * tab), so the strip is re-read, the close retried once after a short settle,
- * and only then does the last resort run — focus the old tab and execute the
- * TUI's own `session.tab.close` command (there is no close route on the TUI
- * HTTP API). The per-tab debug line names which mechanism closed the tab
- * (`tabs.close` / `execute-command`).
+ * tab), so the strip is re-read and the close retried once after a short
+ * settle. `tabs.close` is the only close route — the TUI plugin's `client`
+ * carries no `tui` namespace, so there is no command fallback (row 2739) — and
+ * a refusal on an id the strip no longer lists is the goal state.
  *
  * Focus happens once, after the loop, and only for the tab that was active
  * before the cycle: when that tab's pair closed cleanly, `tabs.focus(forkID)`
@@ -712,7 +696,7 @@ async function forkTabs(client, tabs, data, debug) {
         // Close is verified, never trusted: the strip may queue the removal or
         // refuse silently. `closeTab` re-reads, retries once, and falls back to
         // the TUI's own close command before calling the tab unclosed.
-        const closed = await closeTab(client, tabs, fromSessionID, debug)
+        const closed = await closeTab(tabs, fromSessionID, debug)
         if (closed.leftover) {
             debug(`tabs.fork: ${fromSessionID} → ${toSessionID} still open: ${closed.leftover}`)
             failed.push({ fromSessionID, toSessionID, step: "close", error: closed.leftover })
@@ -836,7 +820,7 @@ export function createTuiControlHandlers({ client, tabs, data, log } = {}) {
         "credential.install": handlerFor((body) => installCredential(client, body, debug)),
         "session.fork": handlerFor((body) => forkSession(client, body)),
         "session.prompt": handlerFor((body) => promptSession(client, body)),
-        "tabs.close": handlerFor((body) => closeSessionTab(client, tabs, body, debug)),
+        "tabs.close": handlerFor((body) => closeSessionTab(tabs, body, debug)),
         "tabs.fork": handlerFor(() => forkTabs(client, tabs, data, debug)),
     }
 }

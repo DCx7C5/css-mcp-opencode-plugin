@@ -335,11 +335,13 @@ function tabSessionIDOf(tab) {
  * `false` and change nothing (a string, an array, or a `(method, sessionID) =>
  * boolean` predicate — the predicate is what refuses the fallback's focus of
  * one specific tab); `refuseClose` makes `close` answer `false` and keep the
- * tab (the silent refusal the fallback exists for); `ignoreClose` makes it
- * answer success without removing the entry (`true` for good, a number for the
- * first N closes — the retry then lands); `unreadableAfter` makes `list()`
- * throw from read N+1 on, so a post-close verification cannot be proven.
- * `remove` simulates the TUI's own close command landing on the strip.
+ * tab (the silent refusal the fallback exists for); `vanishOnClose` makes
+ * `close` answer `false` while dropping the entry (the fork's `open` re-rooted
+ * the strip, so the close matches nothing — the goal state); `ignoreClose`
+ * makes it answer success without removing the entry (`true` for good, a
+ * number for the first N closes — the retry then lands); `unreadableAfter`
+ * makes `list()` throw from read N+1 on, so a post-close verification cannot
+ * be proven.
  *
  * `move(sessionID, index)` mirrors the runtime adapter: an id the strip does
  * not list answers `false`; otherwise the tab is removed and spliced back at
@@ -354,6 +356,7 @@ function fakeStrip(
         refuseOn = [],
         refuseClose = false,
         ignoreClose = false,
+        vanishOnClose = false,
         unreadableAfter,
     } = {},
 ) {
@@ -377,6 +380,14 @@ function fakeStrip(
             return undefined
         }
         if (method === "close") {
+            // The live swap state: the fork's `open` re-roots the strip entry,
+            // so the close matches nothing and answers `false` while the id is
+            // already gone. That refusal is the goal state, not a failure.
+            if (vanishOnClose) {
+                const index = indexOf(sessionID)
+                if (index >= 0) listed.splice(index, 1)
+                return false
+            }
             const refusals = refuseClose === true ? Infinity : Number(refuseClose) || 0
             if (refused < refusals) {
                 refused += 1
@@ -405,12 +416,6 @@ function fakeStrip(
             if (!listed) return tabs
             return listed.slice()
         },
-        /** Simulate the TUI's own `session.tab.close` command landing. */
-        remove(sessionID) {
-            if (!listed) return
-            const index = indexOf(sessionID)
-            if (index >= 0) listed.splice(index, 1)
-        },
         open: record("open"),
         focus: record("focus"),
         close: record("close"),
@@ -430,8 +435,8 @@ function fakeStrip(
 }
 
 /** A client whose `session.fork` maps old ids to new ones, or refuses them. */
-function forkClient(calls, { forks = {}, failFor = [], missing = false, closeCommand } = {}) {
-    const client = {
+function forkClient(calls, { forks = {}, failFor = [], missing = false } = {}) {
+    return {
         session: missing
             ? {}
             : {
@@ -443,17 +448,6 @@ function forkClient(calls, { forks = {}, failFor = [], missing = false, closeCom
                   },
               },
     }
-    if (closeCommand) {
-        // The v2 SDK's TUI command route, as the runtime client exposes it:
-        // `client.tui.executeCommand({ command })`.
-        client.tui = {
-            async executeCommand({ command }) {
-                calls.push({ method: "execute-command", command })
-                closeCommand(command)
-            },
-        }
-    }
-    return client
 }
 
 /** A state bus whose `session.get` answers from a literal table. */
@@ -882,65 +876,28 @@ test("tabs.fork retries a close the strip did not apply and then reports the tab
     ])
 })
 
-test("tabs.fork falls back to the TUI close command when the strip ignores close", async () => {
+test("tabs.fork treats a refused close on an id the strip already dropped as the swap landing", async () => {
     const calls = []
-    const strip = fakeStrip(calls, { tabs: [{ sessionID: "ses_one", active: true }], ignoreClose: true })
+    const strip = fakeStrip(calls, { tabs: [{ sessionID: "ses_one", active: true }], vanishOnClose: true })
     const handlers = createTuiControlHandlers({
-        client: forkClient(calls, {
-            forks: { ses_one: "ses_one_fork" },
-            closeCommand: (command) => {
-                assert.equal(command, "session.tab.close")
-                strip.remove("ses_one")
-            },
-        }),
+        client: forkClient(calls, { forks: { ses_one: "ses_one_fork" } }),
         tabs: strip,
         data: sessionState({}),
         log: silentLog,
     })
 
-    const reply = await invoke(handlers, "tabs.fork", { id: "tf12" })
+    const reply = await invoke(handlers, "tabs.fork", { id: "tf19" })
     assert.deepEqual(reply.payload.moves, [{ fromSessionID: "ses_one", toSessionID: "ses_one_fork" }])
-    assert.deepEqual(reply.payload.degraded, [])
-    assert.deepEqual(reply.payload.unclosed, [])
-    assert.deepEqual(calls, [
-        { method: "fork", sessionID: "ses_one" },
-        { method: "open", sessionID: "ses_one_fork" },
-        { method: "move", sessionID: "ses_one_fork", index: 0 },
-        { method: "close", sessionID: "ses_one" },
-        { method: "close", sessionID: "ses_one" },
-        { method: "focus", sessionID: "ses_one" },
-        { method: "execute-command", command: "session.tab.close" },
-        { method: "focus", sessionID: "ses_one_fork" },
-    ])
-})
-
-test("tabs.fork skips the TUI close command when focusing the old tab is refused", async () => {
-    const calls = []
-    const handlers = createTuiControlHandlers({
-        client: forkClient(calls, { forks: { ses_one: "ses_one_fork" }, closeCommand: () => {} }),
-        tabs: fakeStrip(calls, {
-            tabs: [{ sessionID: "ses_one", active: true }],
-            ignoreClose: true,
-            // The fork tab focuses fine; only the fallback's focus of the OLD tab is refused.
-            refuseOn: (method, sessionID) => method === "focus" && sessionID === "ses_one",
-        }),
-        data: sessionState({}),
-        log: silentLog,
-    })
-
-    const reply = await invoke(handlers, "tabs.fork", { id: "tf18" })
-    assert.deepEqual(reply.payload.moves, [])
-    assert.equal(reply.payload.unclosed.length, 1)
-    assert.equal(reply.payload.unclosed[0].step, "close")
-    assert.match(reply.payload.unclosed[0].error, /tabs\.focus refused ses_one/)
-    assert.match(reply.payload.unclosed[0].error, /close command was not sent/)
-    assert.ok(
-        !calls.some((call) => call.method === "execute-command"),
-        "session.tab.close must not run without the old tab focused",
+    assert.deepEqual(reply.payload.failed, [])
+    assert.deepEqual(reply.payload.unclosed, [], "a refused close on a gone id is not a close failure")
+    assert.equal(
+        calls.filter((entry) => entry.method === "close").length,
+        1,
+        "a close whose id is already gone is not retried",
     )
 })
 
-test("tabs.fork reports a tab unclosed when neither close path removes it", async () => {
+test("tabs.fork reports a tab unclosed when the strip never removes it", async () => {
     const calls = []
     const handlers = createTuiControlHandlers({
         client: forkClient(calls, { forks: { ses_one: "ses_one_fork" } }),
@@ -1082,33 +1039,7 @@ test("tabs.close retries a close the strip did not apply", async () => {
     assert.equal(calls.filter((call) => call.method === "close").length, 2)
 })
 
-test("tabs.close falls back to the TUI close command when the strip ignores close", async () => {
-    const calls = []
-    const strip = fakeStrip(calls, { tabs: [{ sessionID: "ses_one", active: true }], ignoreClose: true })
-    const handlers = createTuiControlHandlers({
-        client: forkClient(calls, {
-            closeCommand: (command) => {
-                assert.equal(command, "session.tab.close")
-                strip.remove("ses_one")
-            },
-        }),
-        tabs: strip,
-        data: sessionState({}),
-        log: silentLog,
-    })
-
-    const reply = await invoke(handlers, "tabs.close", { id: "tc4", sessionID: "ses_one" })
-    assert.equal(reply.ok, true)
-    assert.equal(reply.payload.mechanism, "execute-command")
-    assert.deepEqual(calls, [
-        { method: "close", sessionID: "ses_one" },
-        { method: "close", sessionID: "ses_one" },
-        { method: "focus", sessionID: "ses_one" },
-        { method: "execute-command", command: "session.tab.close" },
-    ])
-})
-
-test("tabs.close reports close_unverified when neither path removes the tab", async () => {
+test("tabs.close reports close_unverified when the strip never removes the tab", async () => {
     const calls = []
     const handlers = createTuiControlHandlers({
         client: forkClient(calls),

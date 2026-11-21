@@ -396,9 +396,11 @@ unclosed}`):
 `tabs.close` (body `{sessionID}`, reply `{sessionID, mechanism}` or a refusal)
 is retained API: the brain's failed-fork undo re-parents and closes nothing, so
 no caller sends it today. It is idempotent (an id already off the strip answers
-`ok`), re-reads after closing, retries once and falls back to the TUI's own
-`session.tab.close` command; `tabs_disabled` / `close_unverified` name the
-refusals.
+`ok`), re-reads after closing, and retries once; a refusal on an id the strip
+no longer lists is the goal state, not a failure. `tabs.close` is the only
+close route — the TUI plugin's client carries no `tui` namespace, so there is
+no command fallback (row 2739) — and `tabs_disabled` / `close_unverified` name
+the real refusals.
 
 ---
 
@@ -542,7 +544,7 @@ uv run --group test pytest   # scripts/client.py smoke tests
   throwing strips, `e:tabs` body/options, event triggers and cleanup; the
   `tabs.fork` swap (fork → open → move → verified close, one post-loop focus),
   move refused/missing degraded, lineage leaves, the fresh-index re-read, open
-  refusal failed-only, close retry + execute-command fallback, and the
-  `tabs.close` idempotent/retained path.
+  refusal failed-only, close retry + a refused close on a gone id counted as
+  the swap landing, and the `tabs.close` idempotent/retained path.
 - `tests/test_client.py` — `strip_plugin_prefix` unit tests (serve/stream
   decode paths in `scripts/client.py`).
