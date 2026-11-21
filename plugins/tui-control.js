@@ -450,12 +450,14 @@ async function closeTab(client, tabs, sessionID, debug) {
 /**
  * Close one tab by session id and prove it left the strip.
  *
- * The brain's fork undo needs the strip to lose a duplicate the session tree
- * alone cannot remove (row 2572): a re-parented copy carries the fork marker,
- * so `isSubagentSession` still reads it as a tab and the next rotation would
- * fork it again. This channel is the wire path that removes it, and it reuses
- * `closeTab` — the same verified close `tabs.fork` runs per tab — so the strip
- * has one close mechanism, never a second.
+ * This channel stays registered and retained even though the Python brain's
+ * failed-fork undo no longer calls it: a `tabs.fork` cycle now reports a
+ * failed open as `failed` only and a close-stage failure as both `failed` and
+ * `unclosed`, so the brain continues the old tab instead of asking this side
+ * to remove a duplicate. It is kept because it is the strip's only one-shot
+ * close route, and it reuses `closeTab` — the same verified close `tabs.fork`
+ * runs after each fork's `open`/`move` — so the strip has one close
+ * mechanism, never a second.
  *
  * Idempotent on purpose: an id the strip no longer lists is the goal state,
  * not a refusal, so a retry after a lost reply answers `ok` instead of
@@ -502,31 +504,63 @@ async function closeSessionTab(client, tabs, body, debug) {
 }
 
 /**
- * Fork every open tab's session and move its tab onto the fork.
+ * Fork every open tab's session and swap its tab onto the fork.
  *
  * The body is ignored — the strip is this side's state, so the brain only
- * sends `{}`. A draft tab has no session and is not a target. A subagent child
- * session is skipped and its tab stays exactly where it is (never forked, never
- * closed); a session that carries a `fork` marker is NOT a child for this
+ * sends `{}`. The strip is read once: the listed order is the target order,
+ * `activeFrom` is the first listed tab flagged `active` with a non-empty
+ * session id, and every non-empty session id is an open id. A draft tab has no
+ * session and is not a target. A subagent child session is skipped and its tab
+ * stays exactly where it is (never forked, never closed) and is the only entry
+ * in `skipped`; a session that carries a `fork` marker is NOT a child for this
  * purpose, because an earlier fork already moved a tab onto it.
  *
- * A move is three measured steps — `open`, `focus`, `close` — and a tab only
- * lands in `moves` when all three succeeded AND a re-read of the strip no
- * longer lists the old id. A step that throws or answers `false` is that
- * step's failure. `close()` resolving is not proof: a strip may queue
- * the removal or answer `false` and keep the tab, so while the old id is still
- * there the close is retried once after a short settle, and only then does the
- * last resort run — focus the old tab and execute the TUI's own
- * `session.tab.close` command (there is no close route on the TUI HTTP API).
- * The per-tab debug line names which mechanism closed the tab
- * (`tabs.close` / `execute-command`). A tab that could not be moved is
- * reported in `failed` with the step it stopped at (`{fromSessionID,
- * toSessionID, step, error}`) and in `unclosed` — its old tab is still open,
- * so the brain must continue that one instead of the fork. A fork that never
- * produced a new tab has no step and is `{fromSessionID, error}` only.
+ * Lineage leaves only: an open id that another open tab names as its
+ * `fork.sessionID` already has its fork tab on the strip, so it is reported in
+ * `lineage` and never forked, moved or closed — forking it again would build a
+ * second fork beside the one it already has.
+ *
+ * A swap is fork → open → move → verified close, in that order, per target.
+ * The old tab's index is re-read for every target, immediately before its
+ * fork, because a degraded move leaves the strip in a different order than an
+ * earlier read would predict; no index means the tab left the strip, so there
+ * is no fork. `tabs.open` appends the fork tab without focusing, and
+ * `tabs.move(forkID, index)` re-splices it into the old tab's slot. A move
+ * that is missing (`tabs.move unavailable`), refused (`false`) or throwing is
+ * `degraded` — `{fromSessionID, toSessionID, step: "move", error}` — and the
+ * close still runs: the fork tab stays at the end of the strip instead of the
+ * old slot, but the swap is logical and the pair still counts in `moves` when
+ * the close is verified. Never a second tab for the same fork.
+ *
+ * The close is the same verified path as `tabs.close`: `close()` resolving is
+ * not proof (a strip may queue the removal or answer `false` and keep the
+ * tab), so the strip is re-read, the close retried once after a short settle,
+ * and only then does the last resort run — focus the old tab and execute the
+ * TUI's own `session.tab.close` command (there is no close route on the TUI
+ * HTTP API). The per-tab debug line names which mechanism closed the tab
+ * (`tabs.close` / `execute-command`).
+ *
+ * Focus happens once, after the loop, and only for the tab that was active
+ * before the cycle: when that tab's pair closed cleanly, `tabs.focus(forkID)`
+ * puts the cursor on its fork. A refused or throwing focus is `degraded` with
+ * `step: "focus"`. No other tab is focused — a per-tab focus would steal the
+ * cursor on every iteration.
+ *
+ * The three failure kinds are distinct:
+ *  - `failed` — `{fromSessionID, toSessionID, step, error}` for a measured
+ *    step that stopped (open/move/close always carry `toSessionID` and
+ *    `step`), and `{fromSessionID, error}` only for a fork that failed or
+ *    produced no id — a fork failure is not a measured step. That tab stops
+ *    here.
+ *  - `unclosed` — the same pair repeated for a close-stage failure only: the
+ *    old tab is still open, so the brain must continue that one instead of the
+ *    fork. A failed open is NOT `unclosed` — no fork tab exists to continue.
+ *  - `degraded` — a step that fell back (move, focus) without stopping the
+ *    swap.
  *
  * One tab's failure never aborts the strip: the loop continues with the
- * remaining tabs.
+ * remaining tabs. The reply always carries all six arrays — `moves`, `failed`,
+ * `skipped`, `lineage`, `degraded`, `unclosed` — empty when nothing happened.
  *
  * @param {object} client
  * @param {object | null | undefined} tabs
@@ -553,15 +587,69 @@ async function forkTabs(client, tabs, data, debug) {
     // that names an id the strip stores under another root is visible here.
     debug(`tabs.fork: ${describeStrip(tabs, data)}`)
 
+    // This one read decides the targets, the pre-cycle active tab and the
+    // lineage edges; the loop re-reads the strip per target, but only for an
+    // index.
+    const targets = []
+    const openIds = new Set()
+    let activeFrom = ""
+    for (const tab of list) {
+        const sessionID = tabSessionID(tab)
+        if (!sessionID) continue
+        targets.push(sessionID)
+        openIds.add(sessionID)
+        if (!activeFrom && tab.active === true) activeFrom = sessionID
+    }
+
+    // A lineage source is an open id another open tab names as its fork
+    // source: its fork tab is already on the strip. The guards keep a missing
+    // session, a malformed marker or a self-reference from manufacturing one.
+    const lineageSources = new Set()
+    for (const sessionID of openIds) {
+        let session
+        try {
+            session = data?.session?.get?.(sessionID)
+        } catch {
+            continue
+        }
+        if (!isObject(session)) continue
+        const fork = session.fork
+        if (!isObject(fork)) continue
+        if (typeof fork.sessionID !== "string" || !fork.sessionID) continue
+        if (fork.sessionID === sessionID) continue
+        if (!openIds.has(fork.sessionID)) continue
+        lineageSources.add(fork.sessionID)
+    }
+
     const moves = []
     const failed = []
-    const unclosed = []
     const skipped = []
-    for (const tab of list) {
-        const fromSessionID = tabSessionID(tab)
-        if (!fromSessionID) continue
+    const lineage = []
+    const degraded = []
+    const unclosed = []
+
+    for (const fromSessionID of targets) {
         if (isSubagentSession(data, fromSessionID)) {
             skipped.push(fromSessionID)
+            continue
+        }
+        if (lineageSources.has(fromSessionID)) {
+            debug(`tabs.fork: ${fromSessionID} is the source of another open tab's fork; leaving its tab alone`)
+            lineage.push(fromSessionID)
+            continue
+        }
+
+        // Re-read per target: a degraded move leaves the fork tab at the end
+        // of the strip, so an index captured earlier would name another tab.
+        let index = -1
+        try {
+            const current = tabs.list()
+            if (Array.isArray(current)) index = current.findIndex((tab) => tabSessionID(tab) === fromSessionID)
+        } catch {
+            index = -1
+        }
+        if (index < 0) {
+            debug(`tabs.fork: ${fromSessionID} is not on the strip any more; skipping`)
             continue
         }
 
@@ -579,40 +667,46 @@ async function forkTabs(client, tabs, data, debug) {
             continue
         }
 
-        // Open and focus are measured steps: the one that threw or answered
-        // `false` is where the tab stopped, and the old tab is still open
-        // either way. A `false` from `open` means no new tab exists; a `false`
-        // from `focus` means the fork tab is open but was not focused.
-        let opened = false
-        let focused = false
-        let stoppedAt = null
-        let reason = null
+        // Open is the one step that can leave no new tab behind: a refusal or
+        // a throw is a failed tab with nothing to close, so it is never
+        // unclosed.
         try {
             if ((await tabs.open(toSessionID)) === false) {
-                stoppedAt = "open"
-                reason = `tabs.open refused ${toSessionID}`
-            } else {
-                opened = true
-                debug(`tabs.fork: ${fromSessionID} → ${toSessionID} open=ok`)
-                if ((await tabs.focus(toSessionID)) === false) {
-                    stoppedAt = "focus"
-                    reason = `tabs.focus refused ${toSessionID}`
-                } else {
-                    focused = true
-                    debug(`tabs.fork: ${fromSessionID} → ${toSessionID} open=ok focus=ok`)
-                }
+                debug(`tabs.fork: ${fromSessionID} → ${toSessionID} open refused`)
+                failed.push({ fromSessionID, toSessionID, step: "open", error: `tabs.open refused ${toSessionID}` })
+                continue
             }
         } catch (error) {
-            stoppedAt = opened ? "focus" : "open"
-            reason = messageOf(error)
-        }
-        if (stoppedAt) {
-            debug(
-                `tabs.fork: ${fromSessionID} → ${toSessionID} stopped at ${stoppedAt} (open=${opened} focus=${focused}): ${reason}`,
-            )
-            failed.push({ fromSessionID, toSessionID, step: stoppedAt, error: reason })
-            unclosed.push({ fromSessionID, toSessionID, step: stoppedAt, error: reason })
+            debug(`tabs.fork: ${fromSessionID} → ${toSessionID} open failed: ${messageOf(error)}`)
+            failed.push({ fromSessionID, toSessionID, step: "open", error: messageOf(error) })
             continue
+        }
+        debug(`tabs.fork: ${fromSessionID} → ${toSessionID} open=ok`)
+
+        // `open` appended the fork tab, so the move is what puts it in the old
+        // tab's slot. A missing, refused or throwing move degrades to the
+        // appended position; the close below still completes the swap.
+        let moveState = "ok"
+        if (typeof tabs.move !== "function") {
+            moveState = "degraded"
+            debug(`tabs.fork: ${fromSessionID} → ${toSessionID} move degraded: tabs.move unavailable`)
+            degraded.push({ fromSessionID, toSessionID, step: "move", error: "tabs.move unavailable" })
+        } else {
+            try {
+                if ((await tabs.move(toSessionID, index)) === false) {
+                    moveState = "degraded"
+                    const reason = `tabs.move refused ${toSessionID} at index ${index}`
+                    debug(`tabs.fork: ${fromSessionID} → ${toSessionID} move degraded: ${reason}`)
+                    degraded.push({ fromSessionID, toSessionID, step: "move", error: reason })
+                } else {
+                    debug(`tabs.fork: ${fromSessionID} → ${toSessionID} move=ok index=${index}`)
+                }
+            } catch (error) {
+                moveState = "degraded"
+                const reason = messageOf(error)
+                debug(`tabs.fork: ${fromSessionID} → ${toSessionID} move degraded: ${reason}`)
+                degraded.push({ fromSessionID, toSessionID, step: "move", error: reason })
+            }
         }
 
         // Close is verified, never trusted: the strip may queue the removal or
@@ -625,15 +719,49 @@ async function forkTabs(client, tabs, data, debug) {
             unclosed.push({ fromSessionID, toSessionID, step: "close", error: closed.leftover })
             continue
         }
-        debug(`tabs.fork: ${fromSessionID} → ${toSessionID} open=ok focus=ok close=ok (via ${closed.mechanism})`)
+        debug(
+            `tabs.fork: ${fromSessionID} → ${toSessionID} open=ok move=${moveState} close=ok (via ${closed.mechanism})`,
+        )
         moves.push({ fromSessionID, toSessionID })
+    }
+
+    // Focus once, after the loop, and only for the tab that was active before
+    // the cycle — its fork now sits in that slot.
+    if (activeFrom) {
+        const pair = moves.find((move) => move.fromSessionID === activeFrom)
+        if (pair) {
+            try {
+                if ((await tabs.focus(pair.toSessionID)) === false) {
+                    const reason = `tabs.focus refused ${pair.toSessionID}`
+                    debug(`tabs.fork: focus of ${pair.toSessionID} degraded: ${reason}`)
+                    degraded.push({
+                        fromSessionID: pair.fromSessionID,
+                        toSessionID: pair.toSessionID,
+                        step: "focus",
+                        error: reason,
+                    })
+                } else {
+                    debug(`tabs.fork: focused ${pair.toSessionID} (fork of the active ${pair.fromSessionID})`)
+                }
+            } catch (error) {
+                const reason = messageOf(error)
+                debug(`tabs.fork: focus of ${pair.toSessionID} degraded: ${reason}`)
+                degraded.push({
+                    fromSessionID: pair.fromSessionID,
+                    toSessionID: pair.toSessionID,
+                    step: "focus",
+                    error: reason,
+                })
+            }
+        }
     }
 
     debug(
         `tabs.fork: moves=${moves.length} failed=${failed.length} ` +
-            `unclosed=${unclosed.length} skipped=${skipped.length}`,
+            `unclosed=${unclosed.length} skipped=${skipped.length} ` +
+            `lineage=${lineage.length} degraded=${degraded.length}`,
     )
-    return success({ moves, failed, skipped, unclosed })
+    return success({ moves, failed, skipped, lineage, degraded, unclosed })
 }
 
 /**

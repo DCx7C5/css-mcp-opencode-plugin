@@ -371,6 +371,37 @@ empty setup snapshot and a populated 15 s snapshot with a live `sessionID`.
 
 ---
 
+## plugins/tui-control.js — TUI control channels (`tabs.fork`, `tabs.close`)
+
+Runs in the TUI process. The Python brain pushes these channels to the `tui`
+part and the transport resolves each reply by id; besides the credential and
+per-session channels (`credential.remove`, `credential.install`,
+`session.fork`, `session.prompt`), this file owns the two tab channels.
+
+`tabs.fork` (body `{}`, reply `{moves, failed, skipped, lineage, degraded,
+unclosed}`):
+
+- swaps every non-subagent tab onto its fork — `session.fork` → `tabs.open` →
+  `tabs.move(forkID, oldIndex)` → verified close of the old tab; the old index
+  is re-read per tab, because a degraded move shifts the strip;
+- leaves a lineage source alone (an open tab another open tab names as its
+  `fork.sessionID`) and reports it under `lineage`; only the leaf is forked;
+- focuses once, after the loop, and only the pre-cycle active tab's fork;
+- treats a missing/refused/throwing `move` and a refused `focus` as `degraded`
+  (the swap still completes on open + close) and never opens a second tab;
+- reports `failed` for a swap that did not complete: a fork-call failure is
+  `{fromSessionID, error}`, an open refusal is `step: "open"` and is not
+  `unclosed`, and an unverified close repeats the pair under `unclosed`.
+
+`tabs.close` (body `{sessionID}`, reply `{sessionID, mechanism}` or a refusal)
+is retained API: the brain's failed-fork undo re-parents and closes nothing, so
+no caller sends it today. It is idempotent (an id already off the strip answers
+`ok`), re-reads after closing, retries once and falls back to the TUI's own
+`session.tab.close` command; `tabs_disabled` / `close_unverified` name the
+refusals.
+
+---
+
 ## plugins/index.js — aggregator (npm/GitHub default)
 
 `package.json` `main`. The default export is a single opencode v2 plugin
@@ -508,6 +539,10 @@ uv run --group test pytest   # scripts/client.py smoke tests
   cooldown; `e:signal` body shape and reply handling.
 - `tests/plugins.tui.test.mjs` — TUI tab payload from both runtime shapes
   (2.2.5 `sessionID` and GUI `key`/`session.id`), drafts, disabled/missing/
-  throwing strips, `e:tabs` body/options, event triggers and cleanup.
+  throwing strips, `e:tabs` body/options, event triggers and cleanup; the
+  `tabs.fork` swap (fork → open → move → verified close, one post-loop focus),
+  move refused/missing degraded, lineage leaves, the fresh-index re-read, open
+  refusal failed-only, close retry + execute-command fallback, and the
+  `tabs.close` idempotent/retained path.
 - `tests/test_client.py` — `strip_plugin_prefix` unit tests (serve/stream
   decode paths in `scripts/client.py`).
