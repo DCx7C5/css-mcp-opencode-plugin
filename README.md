@@ -48,10 +48,27 @@ capabilities). The socket path must be writable by that process.
 
 ## Socket path
 
-Resolved in order: `OPENCODE_PYTHON_SOCK` → `$XDG_RUNTIME_DIR/css-mcp/hooks.sock`
-→ `/tmp/css-mcp/hooks.sock` → legacy `/var/run/css-mcp/hooks.sock` (only if it
-already exists — it requires root to create, so an MCP/ACP child process cannot
-use it).
+Resolved **once, at module load** — `plugins/transport.js` computes the path when
+its ESM singleton is created, which is the plugin's creation point. The env var
+therefore belongs to the process that loads the plugin, and two opencode
+processes can connect to two different sockets without any factory or per-call
+path: the host client keeps `hooks.sock`, while the fixnet tether process
+exports `OPENCODE_PYTHON_SOCK="$XDG_RUNTIME_DIR/css-mcp/hooks-tether.sock"` and
+gets its own connection over its own socket.
+
+Resolution order:
+
+1. `OPENCODE_PYTHON_SOCK` (explicit override — the tether launcher's form)
+2. `$XDG_RUNTIME_DIR/css-mcp/hooks.sock`
+3. `/tmp/css-mcp/hooks.sock`
+4. legacy `/var/run/css-mcp/hooks.sock` — only if it already exists (it
+   requires root to create, so an MCP/ACP child process cannot use it)
+
+The tether path is `$XDG_RUNTIME_DIR/css-mcp/hooks-tether.sock`, provisioned by
+the fixnet launcher. Both sockets feed **one bridge runtime**: the Python side
+serves both listeners from the same process and identifies each client by peer
+pid (`SO_PEERCRED`), so permissions, capabilities and incidents stay shared. A
+second socket is a second transport path, never a second authority.
 
 ## How it works
 
@@ -165,7 +182,7 @@ no `package.json`; the repo-root `main` would otherwise win.
 
 | var | default |
 |-----|---------|
-| `OPENCODE_PYTHON_SOCK` | `$XDG_RUNTIME_DIR/css-mcp/hooks.sock` (or `/tmp/css-mcp/hooks.sock`) |
+| `OPENCODE_PYTHON_SOCK` | `$XDG_RUNTIME_DIR/css-mcp/hooks.sock` (or `/tmp/css-mcp/hooks.sock`); read at module load — the tether process sets `$XDG_RUNTIME_DIR/css-mcp/hooks-tether.sock` |
 | `OPENCODE_BOOTSTRAP_TIMEOUT` | `5000` |
 | `OPENCODE_PRE_TIMEOUT` | `5000` |
 | `OPENCODE_POST_TIMEOUT` | `8000` |
