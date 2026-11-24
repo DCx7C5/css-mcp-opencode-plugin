@@ -154,9 +154,14 @@ export const server = async ({ client, directory: dir, worktree: wt, project: pr
                 log(`post-hook: replacing title for tool=${input.tool}`)
                 output.title = decision.title
             }
-            if (decision.output !== undefined) {
+            if (decision.output !== undefined && decision.output !== null) {
                 log(`post-hook: replacing output for tool=${input.tool} (${String(decision.output).length} chars)`)
                 output.output = decision.output
+            } else if (decision.output === null) {
+                // A brain that echoes an absent result answers `null`; that is
+                // "unchanged", never "blank the tool" (defense in depth — the
+                // v2 adapter drops a null too).
+                log(`post-hook: brain returned null output for tool=${input.tool}, keeping the result`)
             }
             if (decision.metadata && typeof decision.metadata === "object") {
                 const keys = Object.keys(decision.metadata)

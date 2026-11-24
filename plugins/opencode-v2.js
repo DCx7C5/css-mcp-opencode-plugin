@@ -436,14 +436,23 @@ const HOOK_ADAPTERS = {
     }),
     "tool.execute.after": (e) => ({
         input: { tool: e.tool, callID: e.id, sessionID: e.sessionID, args: e.input },
-        output: {},
+        // Seed the v1-shaped output from the real v2 result. Without it the
+        // post-hook body sees `output.output === undefined`: the brain gets a
+        // blank result (so the bash secret scrub never matches) and a brain
+        // that echoes what it received answers `null`, which then blanks the
+        // tool result for Code Mode. The v1 post-hook mutates this object in
+        // place and `sync()` writes back only what actually changed.
+        output: { output: e.result?.output, metadata: e.result?.metadata },
         sync() {
             if (e.status !== "completed") return
             // v2 Tool.Result has {output?, content?, metadata?}; post-hook
             // also set a title which has no v2 slot, so it is dropped.
             const prev = e.result ?? {}
             const next = { ...prev }
-            if (this.output.output !== undefined) next.output = this.output.output
+            // `null` is not a valid v2 Tool.Result.output — it means the brain
+            // echoed an absent result, never "blank this tool". Keep the real
+            // one so a null-echoing brain cannot break the bridge.
+            if (this.output.output !== undefined && this.output.output !== null) next.output = this.output.output
             if (this.output.metadata && typeof this.output.metadata === "object")
                 next.metadata = { ...(prev.metadata ?? {}), ...this.output.metadata }
             e.result = next
